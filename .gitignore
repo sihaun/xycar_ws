@@ -1,0 +1,17 @@
+.agents
+.claude
+.codex
+.git
+
+log/*
+build/*
+image/*
+install/*
+
+src/*
+!src/track_drive/
+!src/track_drive/**
+
+*.pdf
+
+__pycache__/
