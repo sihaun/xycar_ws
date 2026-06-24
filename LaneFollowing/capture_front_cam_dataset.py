@@ -137,7 +137,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Append-only ROS2 front camera dataset capture")
     parser.add_argument("--dataset-dir", default="LaneFollowing/raw_front_cam_dataset")
     parser.add_argument("--topic", default="/usb_cam/image_raw/front")
-    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--interval", type=float, default=0.05)
     parser.add_argument("--crop", type=int, nargs=4, default=(0, 0, 0, 0), metavar=("X", "Y", "W", "H"))
     return parser.parse_args()
 

@@ -3,10 +3,10 @@
 
 import argparse
 import csv
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from uuid import uuid1
 
 import cv2
 
@@ -36,6 +36,14 @@ def path_for_csv(path):
 
 def normalized_path_key(path):
     return str(Path(path).expanduser().resolve())
+
+
+def delete_raw_image(raw_path):
+    try:
+        raw_path.unlink()
+        print(f"deleted raw image: {raw_path}")
+    except FileNotFoundError:
+        print(f"raw image already missing: {raw_path}")
 
 
 def raw_images_from_manifest(raw_dir):
@@ -125,8 +133,22 @@ def mouse_callback(event, x, y, flags, state):
         print(f"mouse click x={state.x} y={state.y}")
 
 
-def make_labeled_filename(x, y):
-    return f"xy_{x:03d}_{y:03d}_{uuid1()}.jpg"
+def next_labeled_sequence(dataset_dir):
+    max_seq = -1
+    count = 0
+    pattern = re.compile(r"^xy_\d{3}_\d{3}_(\d{6})\.jpg$")
+    for path in dataset_dir.glob("xy_*.jpg"):
+        count += 1
+        match = pattern.match(path.name)
+        if match:
+            max_seq = max(max_seq, int(match.group(1)))
+    if max_seq >= 0:
+        return max_seq + 1
+    return count
+
+
+def make_labeled_filename(x, y, sequence):
+    return f"xy_{x:03d}_{y:03d}_{sequence:06d}.jpg"
 
 
 def direction_line_points(w, h, x, y):
@@ -182,7 +204,7 @@ def draw_overlay(image, state, index, total, raw_path):
         cv2.circle(view, (state.x, state.y), 4, (0, 0, 255), 1, cv2.LINE_AA)
     cv2.putText(
         view,
-        f"{index + 1}/{total} s:save n:skip q:quit",
+        f"{index + 1}/{total} s:save n:skip e:delete q:quit",
         (5, 17),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
@@ -232,6 +254,7 @@ def label_images(args):
         return
 
     csv_file, writer = open_label_writer(label_csv, append_csv)
+    label_sequence = next_labeled_sequence(dataset_dir) if append_csv else 0
     state = LabelState()
 
     cv2.namedWindow("Lane Label", cv2.WINDOW_GUI_EXPANDED)
@@ -256,12 +279,15 @@ def label_images(args):
                     return
                 if key == ord("n"):
                     break
+                if key == ord("e"):
+                    delete_raw_image(raw_path)
+                    break
                 if key == ord("s"):
                     if state.x is None or state.y is None:
                         print("click a target point first")
                         continue
 
-                    filename = make_labeled_filename(state.x, state.y)
+                    filename = make_labeled_filename(state.x, state.y, label_sequence)
                     labeled_path = dataset_dir / filename
                     cv2.imwrite(str(labeled_path), image)
                     writer.writerow({
@@ -272,6 +298,7 @@ def label_images(args):
                         "labeled_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                     })
                     csv_file.flush()
+                    label_sequence += 1
                     print(f"saved {labeled_path}")
                     break
     finally:

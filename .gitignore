@@ -13,5 +13,9 @@ src/*
 !src/track_drive/**
 
 *.pdf
+*.png
+*.jpg
+*.csv
+
 
 __pycache__/

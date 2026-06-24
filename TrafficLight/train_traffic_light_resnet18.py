@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+from pathlib import Path
+
+import torch
+import torch.optim as optim
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+
+try:
+    from tqdm import tqdm
+except ImportError as exc:
+    raise RuntimeError("tqdm is required. Install it with: python3 -m pip install tqdm") from exc
+
+
+CLASS_NAMES = [
+    "0_none",
+    "1_red",
+    "2_yellow",
+    "3_green",
+    "4_red_left",
+]
+EXPECTED_CLASS_TO_IDX = {class_name: index for index, class_name in enumerate(CLASS_NAMES)}
+CLASS_NONE = 0
+CLASS_RED = 1
+CLASS_YELLOW = 2
+CLASS_GREEN = 3
+CLASS_RED_LEFT = 4
+
+
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group["lr"]
+    return 0.0
+
+
+def build_model(num_classes, pretrained=True):
+    try:
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
+    except AttributeError:
+        model = models.resnet18(pretrained=pretrained)
+    model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+
+def resolve_device(name):
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested, but torch.cuda.is_available() is False")
+    return torch.device(name)
+
+
+def make_dataset(dataset_dir, image_size):
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    return datasets.ImageFolder(dataset_dir, transform=transform)
+
+
+def split_dataset(dataset, test_percent):
+    num_test = int(test_percent * len(dataset))
+    if len(dataset) > 1:
+        num_test = max(1, min(num_test, len(dataset) - 1))
+    else:
+        num_test = 0
+    generator = torch.Generator().manual_seed(42)
+    return torch.utils.data.random_split(dataset, [len(dataset) - num_test, num_test], generator=generator)
+
+
+def evaluate(model, loader, device, loss_fn, num_classes):
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    count = 0
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            loss = loss_fn(outputs, labels)
+            preds = torch.argmax(outputs, dim=1)
+
+            batch_size = labels.size(0)
+            loss_sum += float(loss) * batch_size
+            correct += int((preds == labels).sum())
+            count += batch_size
+
+            for target, pred in zip(labels.cpu(), preds.cpu()):
+                confusion[int(target), int(pred)] += 1
+
+    avg_loss = loss_sum / max(count, 1)
+    acc = 100.0 * correct / max(count, 1)
+    return avg_loss, acc, confusion
+
+
+def build_loss_fn(args, device):
+    class_weights = torch.ones(len(CLASS_NAMES), device=device)
+    class_weights[CLASS_RED_LEFT] = float(args.red_left_class_weight)
+    ce_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+
+    def loss_fn(outputs, labels):
+        loss = ce_loss(outputs, labels)
+        if args.red_left_confusion_penalty <= 0.0:
+            return loss
+
+        red_left_mask = labels == CLASS_RED_LEFT
+        if not bool(red_left_mask.any()):
+            return loss
+
+        red_left_logits = outputs[red_left_mask, CLASS_RED_LEFT]
+        red_logits = outputs[red_left_mask, CLASS_RED]
+        green_logits = outputs[red_left_mask, CLASS_GREEN]
+        margin = float(args.red_left_confusion_margin)
+
+        # 정답이 좌회전 신호일 때 red/green이 red_left에 가까워지면 추가 벌점을 준다.
+        red_penalty = torch.relu(red_logits - red_left_logits + margin)
+        green_penalty = torch.relu(green_logits - red_left_logits + margin)
+        confusion_penalty = (red_penalty + green_penalty).mean()
+        return loss + float(args.red_left_confusion_penalty) * confusion_penalty
+
+    return loss_fn
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train ResNet18 traffic light classifier")
+    parser.add_argument("--dataset-dir", default="TrafficLight/dataset")
+    parser.add_argument("--best-model-path", default="TrafficLight/best_traffic_light_resnet18.pth")
+    parser.add_argument("--last-model-path", default="TrafficLight/last_traffic_light_resnet18.pth")
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--test-percent", type=float, default=0.2)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="cuda")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--red-left-class-weight", type=float, default=1.5)
+    parser.add_argument("--red-left-confusion-penalty", type=float, default=2.0)
+    parser.add_argument("--red-left-confusion-margin", type=float, default=1.0)
+    parser.add_argument("--no-pretrained", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    dataset = make_dataset(args.dataset_dir, args.image_size)
+    if len(dataset) == 0:
+        raise RuntimeError(f"No images found in dataset directory: {args.dataset_dir}")
+
+    if dataset.class_to_idx != EXPECTED_CLASS_TO_IDX:
+        raise RuntimeError(
+            f"Expected class mapping {EXPECTED_CLASS_TO_IDX}, got {dataset.class_to_idx}. "
+            "Use TrafficLight/dataset/0_none ... 4_red_left directories."
+        )
+
+    train_dataset, test_dataset = split_dataset(dataset, args.test_percent)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    device = resolve_device(args.device)
+    model = build_model(num_classes=len(CLASS_NAMES), pretrained=not args.no_pretrained).to(device)
+    loss_fn = build_loss_fn(args, device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    Path(args.best_model_path).parent.mkdir(parents=True, exist_ok=True)
+    if args.last_model_path:
+        Path(args.last_model_path).parent.mkdir(parents=True, exist_ok=True)
+
+    best_acc = -1.0
+    best_loss = 1e9
+
+    print(f"dataset: {len(dataset)} images classes={dataset.class_to_idx}")
+    print(f"train/test: {len(train_dataset)}/{len(test_dataset)}")
+    print(f"device: {device}")
+    print(f"best model path: {args.best_model_path}")
+    print(f"last model path: {args.last_model_path}")
+    print("labels: 0=none, 1=red, 2=yellow, 3=green, 4=red+left")
+    print(
+        "red_left penalty: "
+        f"class_weight={args.red_left_class_weight:.2f} "
+        f"confusion_penalty={args.red_left_confusion_penalty:.2f} "
+        f"margin={args.red_left_confusion_margin:.2f}"
+    )
+
+    for epoch in tqdm(range(args.epochs)):
+        model.train()
+        train_loss = 0.0
+        train_count = 0
+
+        for images, labels in train_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            batch_size = labels.size(0)
+            train_loss += float(loss) * batch_size
+            train_count += batch_size
+
+        train_loss /= max(train_count, 1)
+        test_loss, test_acc, confusion = evaluate(
+            model,
+            test_loader,
+            device,
+            loss_fn,
+            num_classes=len(CLASS_NAMES),
+        )
+
+        if args.last_model_path:
+            torch.save(model.state_dict(), args.last_model_path)
+
+        improved = test_acc > best_acc or (test_acc == best_acc and test_loss < best_loss)
+        if improved:
+            best_acc = test_acc
+            best_loss = test_loss
+            torch.save(model.state_dict(), args.best_model_path)
+            saved = " saved_best"
+        else:
+            saved = ""
+
+        print(
+            f"epoch={epoch + 1:03d} train_loss={train_loss:.6f} "
+            f"test_loss={test_loss:.6f} test_acc={test_acc:.2f}% "
+            f"lr={get_lr(optimizer):.6f}{saved}"
+        )
+        print(f"confusion rows=true cols=pred: {confusion.tolist()}")
+
+
+if __name__ == "__main__":
+    main()
