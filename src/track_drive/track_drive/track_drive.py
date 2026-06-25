@@ -12,6 +12,7 @@
 
 import math
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -209,6 +210,8 @@ SHORTCUT_INFERENCE_PERIOD = 0.02
 
 SHORTCUT_CHECK_ENABLED = True
 SHORTCUT_CHECK_SPEED = 10.0
+SHORTCUT_SLOWDOWN_START_SPEED = 20.0
+SHORTCUT_SLOWDOWN_RAMP_TIME = 1.5
 SHORTCUT_CHECK_LOG_PERIOD = 0.2
 SHORTCUT_OPEN_THRESHOLD = 0.70
 SHORTCUT_FUSION_HOLD_TIME = 0.6
@@ -217,7 +220,6 @@ SHORTCUT_CACHE_WINDOW = 1.2
 SHORTCUT_CACHE_MIN_SAMPLES = 3
 SHORTCUT_CAMERA_TRIGGER_ENABLED = False
 SHORTCUT_LAST_CHANCE_FORCE_OPEN = False
-SHORTCUT_DRIVE_MAX_TIME = 20.0
 TRAFFIC_GROUP_TOTAL = 6
 ROUTE_SIGNAL_TOTAL = 3
 ROUND_TOTAL = 3
@@ -265,6 +267,7 @@ SCHOOLZONE_MODEL_PATH = "/home/xytron/xycar_ws/SchoolZone/schoolzone_detect/best
 SCHOOLZONE_DEVICE = "cuda"
 SCHOOLZONE_INFERENCE_PERIOD = 0.02
 SCHOOLZONE_DETECT_THRESHOLD = 0.70
+SCHOOLZONE_DETECT_HOLD_TIME = 0.4
 SCHOOLZONE_SPEED_LIMIT = 20.0
 SCHOOLZONE_LOG_PERIOD = 0.5
 
@@ -376,6 +379,8 @@ class TrackDriverNode(Node):
 
     def __init__(self):
         super().__init__("driver")
+        self.node_log_start_time = time.monotonic()
+        self.mission_log_start_time = None
 
         self.front_image = None
         self.latest_scan = None
@@ -415,6 +420,7 @@ class TrackDriverNode(Node):
             "camera": self.new_shortcut_sensor_state(),
             "lidar": self.new_shortcut_sensor_state(),
         }
+        self.shortcut_slowdown_start_time = None
         self.shortcut_check_last_report_time = 0.0
         self.overtake_monitor_enabled = False
         self.overtake_pending_after_green = False
@@ -439,6 +445,7 @@ class TrackDriverNode(Node):
         self.schoolzone_raw_class_id = 0
         self.schoolzone_raw_class_name = "none"
         self.schoolzone_raw_prob = 0.0
+        self.schoolzone_candidate_start_time = None
         self.schoolzone_active = False
         self.schoolzone_last_report_time = 0.0
         self.traffic_raw_class_id = CLASS_NONE
@@ -542,7 +549,34 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data,
         )
         self.create_timer(CONTROL_PERIOD, self.control_loop)
-        self.get_logger().info("----- track_drive traffic/cone/lane/shortcut/overtake/cornering models started -----")
+        self.log_info("----- track_drive traffic/cone/lane/shortcut/overtake/cornering models started -----")
+
+    def log_prefix(self):
+        base_time = self.mission_log_start_time or self.node_log_start_time
+        elapsed = time.monotonic() - base_time
+        return f"[KST {datetime.now().strftime('%H:%M:%S')}] [T+{elapsed:07.2f}s]"
+
+    def log_info(self, message):
+        self.get_logger().info(f"{self.log_prefix()} {message}")
+
+    def log_warning(self, message):
+        self.get_logger().warning(f"{self.log_prefix()} {message}")
+
+    def log_error(self, message):
+        self.get_logger().error(f"{self.log_prefix()} {message}")
+
+    def reset_shortcut_slowdown(self):
+        self.shortcut_slowdown_start_time = None
+
+    def shortcut_slowdown_speed_limit(self, now):
+        if self.shortcut_slowdown_start_time is None:
+            self.shortcut_slowdown_start_time = now
+
+        ramp_time = max(float(SHORTCUT_SLOWDOWN_RAMP_TIME), 1e-6)
+        ratio = max(0.0, min((now - self.shortcut_slowdown_start_time) / ramp_time, 1.0))
+        start_speed = float(SHORTCUT_SLOWDOWN_START_SPEED)
+        end_speed = float(SHORTCUT_CHECK_SPEED)
+        return start_speed + (end_speed - start_speed) * ratio
 
     def create_lane_driver(
         self,
@@ -557,7 +591,7 @@ class TrackDriverNode(Node):
         device=LANE_DEVICE,
     ):
         if LaneModelDriver is None:
-            self.get_logger().error(f"lane_drive import failed: {LANE_IMPORT_ERROR}")
+            self.log_error(f"lane_drive import failed: {LANE_IMPORT_ERROR}")
             return None
 
         try:
@@ -572,7 +606,7 @@ class TrackDriverNode(Node):
                 inference_period=inference_period,
             )
         except Exception as exc:
-            self.get_logger().error(f"{name} model load failed: {exc}")
+            self.log_error(f"{name} model load failed: {exc}")
             return None
 
         driver.drive_name = name
@@ -590,7 +624,7 @@ class TrackDriverNode(Node):
         else:
             driver.steer_speed_min_ratio = STEER_SPEED_MIN_RATIO
 
-        self.get_logger().info(
+        self.log_info(
             f"{name} model loaded: {driver.model_path} device={driver.device} "
             f"steer_speed_min_ratio={driver.steer_speed_min_ratio:.2f}"
         )
@@ -598,7 +632,7 @@ class TrackDriverNode(Node):
 
     def create_shortcut_camera_detector(self):
         if ShortcutCameraDetector is None:
-            self.get_logger().error(f"shortcut camera detector import failed: {SHORTCUT_IMPORT_ERROR}")
+            self.log_error(f"shortcut camera detector import failed: {SHORTCUT_IMPORT_ERROR}")
             return None
 
         try:
@@ -609,15 +643,15 @@ class TrackDriverNode(Node):
                 open_threshold=SHORTCUT_OPEN_THRESHOLD,
             )
         except Exception as exc:
-            self.get_logger().error(f"shortcut camera detect model load failed: {exc}")
+            self.log_error(f"shortcut camera detect model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"shortcut camera detect model loaded: {detector.model_path} device={detector.device}")
+        self.log_info(f"shortcut camera detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_shortcut_lidar_detector(self):
         if ShortcutDetector is None:
-            self.get_logger().error(f"shortcut lidar detector import failed: {SHORTCUT_IMPORT_ERROR}")
+            self.log_error(f"shortcut lidar detector import failed: {SHORTCUT_IMPORT_ERROR}")
             return None
 
         try:
@@ -628,15 +662,15 @@ class TrackDriverNode(Node):
                 open_threshold=SHORTCUT_OPEN_THRESHOLD,
             )
         except Exception as exc:
-            self.get_logger().error(f"shortcut lidar detect model load failed: {exc}")
+            self.log_error(f"shortcut lidar detect model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"shortcut lidar detect model loaded: {detector.model_path} device={detector.device}")
+        self.log_info(f"shortcut lidar detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_overtake_detector(self):
         if OvertakeCameraDetector is None:
-            self.get_logger().error(f"overtake detector import failed: {OVERTAKE_IMPORT_ERROR}")
+            self.log_error(f"overtake detector import failed: {OVERTAKE_IMPORT_ERROR}")
             return None
 
         try:
@@ -646,15 +680,15 @@ class TrackDriverNode(Node):
                 inference_period=OVERTAKE_DETECT_INFERENCE_PERIOD,
             )
         except Exception as exc:
-            self.get_logger().error(f"overtake camera detect model load failed: {exc}")
+            self.log_error(f"overtake camera detect model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"overtake camera detect model loaded: {detector.model_path} device={detector.device}")
+        self.log_info(f"overtake camera detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_overtake_camera_driver(self):
         if OvertakeCameraDriver is None:
-            self.get_logger().error(f"overtake camera driver import failed: {OVERTAKE_IMPORT_ERROR}")
+            self.log_error(f"overtake camera driver import failed: {OVERTAKE_IMPORT_ERROR}")
             return None
 
         try:
@@ -669,15 +703,15 @@ class TrackDriverNode(Node):
                 inference_period=OVERTAKE_INFERENCE_PERIOD,
             )
         except Exception as exc:
-            self.get_logger().error(f"overtake driving model load failed: {exc}")
+            self.log_error(f"overtake driving model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"overtake camera driving model loaded: {driver.model_path} device={driver.device}")
+        self.log_info(f"overtake camera driving model loaded: {driver.model_path} device={driver.device}")
         return driver
 
     def create_cornering_detector(self):
         if CorneringCameraDetector is None:
-            self.get_logger().error(f"cornering detector import failed: {CORNERING_IMPORT_ERROR}")
+            self.log_error(f"cornering detector import failed: {CORNERING_IMPORT_ERROR}")
             return None
 
         try:
@@ -687,10 +721,10 @@ class TrackDriverNode(Node):
                 inference_period=CORNERING_DETECT_INFERENCE_PERIOD,
             )
         except Exception as exc:
-            self.get_logger().error(f"cornering camera detect model load failed: {exc}")
+            self.log_error(f"cornering camera detect model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"cornering camera detect model loaded: {detector.model_path} device={detector.device}")
+        self.log_info(f"cornering camera detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_schoolzone_detector(self):
@@ -701,15 +735,15 @@ class TrackDriverNode(Node):
                 inference_period=SCHOOLZONE_INFERENCE_PERIOD,
             )
         except Exception as exc:
-            self.get_logger().error(f"schoolzone camera detect model load failed: {exc}")
+            self.log_error(f"schoolzone camera detect model load failed: {exc}")
             return None
 
-        self.get_logger().info(f"schoolzone camera detect model loaded: {detector.model_path} device={detector.device}")
+        self.log_info(f"schoolzone camera detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_traffic_light_classifier(self):
         if TrafficLightClassifier is None:
-            self.get_logger().error(f"traffic light classifier import failed: {TRAFFIC_LIGHT_IMPORT_ERROR}")
+            self.log_error(f"traffic light classifier import failed: {TRAFFIC_LIGHT_IMPORT_ERROR}")
             return None
 
         try:
@@ -720,10 +754,10 @@ class TrackDriverNode(Node):
                 inference_period=TRAFFIC_LIGHT_INFERENCE_PERIOD,
             )
         except Exception as exc:
-            self.get_logger().error(f"traffic light model load failed: {exc}")
+            self.log_error(f"traffic light model load failed: {exc}")
             return None
 
-        self.get_logger().info(
+        self.log_info(
             f"traffic light model loaded: {classifier.model_path} device={classifier.device}"
         )
         return classifier
@@ -819,14 +853,14 @@ class TrackDriverNode(Node):
         ):
             hard_speed_limit = CORNERING_DRIVE_SPEED
         elif self.state == STATE_LANE and self.should_limit_active_shortcut_speed():
-            hard_speed_limit = SHORTCUT_CHECK_SPEED
+            hard_speed_limit = self.shortcut_slowdown_speed_limit(time.monotonic())
         elif self.state in (STATE_SHORTCUT_CHECK, STATE_SHORTCUT_WAIT_TRAFFIC):
-            hard_speed_limit = SHORTCUT_CHECK_SPEED
+            hard_speed_limit = self.shortcut_slowdown_speed_limit(time.monotonic())
         elif (
             self.state == STATE_SHORTCUT_WAIT_GREEN
             and self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX
         ):
-            hard_speed_limit = SHORTCUT_CHECK_SPEED
+            hard_speed_limit = self.shortcut_slowdown_speed_limit(time.monotonic())
         if self.schoolzone_active:
             if hard_speed_limit is None:
                 hard_speed_limit = SCHOOLZONE_SPEED_LIMIT
@@ -951,7 +985,7 @@ class TrackDriverNode(Node):
 
     def start_overtake_monitor(self, now, reason):
         if self.overtake_detector is None:
-            self.get_logger().warning(f"OVERTAKE_DETECT skipped: detector is not ready ({reason})")
+            self.log_warning(f"OVERTAKE_DETECT skipped: detector is not ready ({reason})")
             return
 
         self.overtake_monitor_enabled = True
@@ -960,7 +994,7 @@ class TrackDriverNode(Node):
         self.overtake_last_report_time = 0.0
         self.reset_overtake_detection()
         self.overtake_detector.reset()
-        self.get_logger().info(
+        self.log_info(
             f"OVERTAKE_DETECT ON reason={reason} "
             f"source=front_cam hold={OVERTAKE_DETECT_HOLD_TIME:.1f}s "
             f"threshold={OVERTAKE_DETECT_THRESHOLD:.2f}"
@@ -968,7 +1002,7 @@ class TrackDriverNode(Node):
 
     def stop_overtake_monitor(self, reason):
         if self.overtake_monitor_enabled or self.overtake_pending_after_green:
-            self.get_logger().info(f"OVERTAKE_DETECT OFF reason={reason}")
+            self.log_info(f"OVERTAKE_DETECT OFF reason={reason}")
         self.overtake_monitor_enabled = False
         self.overtake_pending_after_green = False
         self.reset_overtake_detection()
@@ -1004,7 +1038,7 @@ class TrackDriverNode(Node):
 
         if now - self.overtake_last_report_time >= OVERTAKE_LOG_PERIOD:
             self.overtake_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"{label} running yes={int(is_yes)} held={held:.2f}/"
                 f"{hold_time:.2f}s "
                 f"det=({class_id},{class_name},{probability:.2f})"
@@ -1038,7 +1072,7 @@ class TrackDriverNode(Node):
             "OVERTAKE_FAST",
             require_monitor=False,
         ):
-            self.get_logger().info(
+            self.log_info(
                 f"OVERTAKE_FAST confirmed for {OVERTAKE_FAST_HOLD_TIME:.1f}s "
                 f"in {self.state} -> MODEL SWITCH {self.state} -> OVERTAKE_DRIVE"
             )
@@ -1076,7 +1110,7 @@ class TrackDriverNode(Node):
 
         if now - self.overtake_last_report_time >= OVERTAKE_LOG_PERIOD:
             self.overtake_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"OVERTAKE_DRIVE detect yes={int(is_yes)} force_left={force_left:.2f}/"
                 f"{OVERTAKE_FORCE_AFTER_LAST_YES_TIME:.2f}s "
                 f"det=({class_id},{class_name},{probability:.2f})"
@@ -1086,7 +1120,7 @@ class TrackDriverNode(Node):
 
     def start_overtake_drive(self, now):
         if self.overtake_camera_driver is None or self.front_image is None:
-            self.get_logger().warning("OVERTAKE_DRIVE skipped: camera driver or front image is not ready")
+            self.log_warning("OVERTAKE_DRIVE skipped: camera driver or front image is not ready")
             self.overtake_done_in_segment = True
             self.stop_overtake_monitor("overtake drive unavailable")
             return False
@@ -1110,16 +1144,16 @@ class TrackDriverNode(Node):
         if self.overtake_detector is not None:
             self.overtake_detector.reset()
         self.last_log_time = now
-        self.get_logger().info(
+        self.log_info(
             f"OVERTAKE_DETECT confirmed for {self.overtake_confirm_hold_time:.1f}s "
-            f"-> MODEL SWITCH LANE -> OVERTAKE_DRIVE camera model ON; force after last yes="
+            f"-> MODEL SWITCH {self.state} -> OVERTAKE_DRIVE camera model ON; force after last yes="
             f"{OVERTAKE_FORCE_AFTER_LAST_YES_TIME:.1f}s"
         )
         self.set_state(STATE_OVERTAKE_DRIVE)
         return True
 
     def finish_overtake_drive(self, now, reason):
-        self.get_logger().info(f"MODEL SWITCH OVERTAKE_DRIVE -> LANE reason={reason}")
+        self.log_info(f"MODEL SWITCH OVERTAKE_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
             self.reset_driver_angle_filter(self.lane_driver)
@@ -1173,7 +1207,7 @@ class TrackDriverNode(Node):
                 if self.cornering_last_yes_time is None
                 else f"{now - self.cornering_last_yes_time:.2f}"
             )
-            self.get_logger().info(
+            self.log_info(
                 f"CORNERING_DETECT running yes={int(is_yes)} held={held:.2f}/"
                 f"{CORNERING_DETECT_HOLD_TIME:.2f}s grace={grace_text}/"
                 f"{CORNERING_DETECT_GRACE_TIME:.2f}s "
@@ -1187,6 +1221,7 @@ class TrackDriverNode(Node):
             self.schoolzone_raw_class_id = 0
             self.schoolzone_raw_class_name = "none"
             self.schoolzone_raw_prob = 0.0
+            self.schoolzone_candidate_start_time = None
             self.schoolzone_active = False
             return False
 
@@ -1195,15 +1230,21 @@ class TrackDriverNode(Node):
         self.schoolzone_raw_class_id = class_id
         self.schoolzone_raw_class_name = class_name
         self.schoolzone_raw_prob = probability
-        self.schoolzone_active = (
-            class_id == CLASS_SCHOOLZONE
-            and probability >= SCHOOLZONE_DETECT_THRESHOLD
-        )
+        is_yes = class_id == CLASS_SCHOOLZONE and probability >= SCHOOLZONE_DETECT_THRESHOLD
+        if is_yes:
+            if self.schoolzone_candidate_start_time is None:
+                self.schoolzone_candidate_start_time = now
+            held = now - self.schoolzone_candidate_start_time
+        else:
+            self.schoolzone_candidate_start_time = None
+            held = 0.0
+        self.schoolzone_active = is_yes and held >= SCHOOLZONE_DETECT_HOLD_TIME
 
         if self.schoolzone_active != was_active or now - self.schoolzone_last_report_time >= SCHOOLZONE_LOG_PERIOD:
             self.schoolzone_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"SCHOOLZONE detect active={int(self.schoolzone_active)} "
+                f"held={held:.2f}/{SCHOOLZONE_DETECT_HOLD_TIME:.2f}s "
                 f"det=({class_id},{class_name},{probability:.2f}) "
                 f"speed_limit={SCHOOLZONE_SPEED_LIMIT:.1f}"
             )
@@ -1216,7 +1257,7 @@ class TrackDriverNode(Node):
             return False
 
         if self.cornering_lane_driver is None or self.front_image is None:
-            self.get_logger().warning("CORNERING_DRIVE skipped: driver or front image is not ready")
+            self.log_warning("CORNERING_DRIVE skipped: driver or front image is not ready")
             self.reset_cornering_detection()
             return False
 
@@ -1225,7 +1266,7 @@ class TrackDriverNode(Node):
         self.reset_lane_pulse()
         self.cornering_no_start_time = None
         self.last_log_time = now
-        self.get_logger().info(
+        self.log_info(
             f"CORNERING_DETECT confirmed for {CORNERING_DETECT_HOLD_TIME:.1f}s "
             f"-> MODEL SWITCH LANE -> CORNER_DRIVE camera model ON"
         )
@@ -1237,7 +1278,7 @@ class TrackDriverNode(Node):
         if drive_elapsed < CORNERING_MIN_DRIVE_TIME:
             if now - self.cornering_last_report_time >= CORNERING_LOG_PERIOD:
                 self.cornering_last_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"CORNERING_DRIVE min_hold={drive_elapsed:.2f}/"
                     f"{CORNERING_MIN_DRIVE_TIME:.2f}s"
                 )
@@ -1264,7 +1305,7 @@ class TrackDriverNode(Node):
         no_held = 0.0 if self.cornering_no_start_time is None else now - self.cornering_no_start_time
         if now - self.cornering_last_report_time >= CORNERING_LOG_PERIOD:
             self.cornering_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"CORNERING_DRIVE detect yes={int(is_yes)} no_held={no_held:.2f}/"
                 f"{CORNERING_CLEAR_HOLD_TIME:.2f}s "
                 f"det=({class_id},{class_name},{probability:.2f})"
@@ -1273,7 +1314,7 @@ class TrackDriverNode(Node):
         return no_held >= CORNERING_CLEAR_HOLD_TIME
 
     def finish_corner_drive(self, now, reason):
-        self.get_logger().info(f"MODEL SWITCH CORNER_DRIVE -> LANE reason={reason}")
+        self.log_info(f"MODEL SWITCH CORNER_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
             self.reset_driver_angle_filter(self.lane_driver)
@@ -1425,7 +1466,7 @@ class TrackDriverNode(Node):
             return
         self.state = next_state
         self.state_start_time = time.monotonic()
-        self.get_logger().info(f"STATE -> {next_state}")
+        self.log_info(f"STATE -> {next_state}")
 
     def is_shortcut_traffic_group(self, group_index):
         # 시작 신호등은 WAIT_GREEN/CONE에서 처리하고, 라바콘 이후 1/3/5번째만 지름길 판단 신호등이다.
@@ -1436,6 +1477,9 @@ class TrackDriverNode(Node):
 
     def is_active_shortcut_signal(self):
         return self.is_shortcut_traffic_group(self.active_traffic_group)
+
+    def is_active_middle_signal(self):
+        return self.is_middle_traffic_group(self.active_traffic_group)
 
     def is_first_forced_straight_signal(self):
         return (
@@ -1462,6 +1506,21 @@ class TrackDriverNode(Node):
         if not (self.traffic_visible or self.traffic_raw_visible):
             return False
         return True
+
+    def should_stop_after_shortcut_taken_for_signal(self, now):
+        # 지름길을 한 번 탔더라도 이후 shortcut 그룹 신호등은 초록불일 때만 통과한다.
+        # 이 경로는 지름길 판단은 생략하지만 신호 대기는 생략하면 안 된다.
+        if not self.shortcut_left_taken:
+            return False
+        if self.green_visible:
+            return False
+        if not (self.traffic_visible or self.traffic_raw_visible):
+            return False
+        if self.is_active_middle_signal():
+            return False
+        if self.is_active_shortcut_signal():
+            return True
+        return self.is_next_shortcut_signal_pending(now)
 
     def should_crawl_first_shortcut_wait_green(self, now):
         if self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
@@ -1755,12 +1814,15 @@ class TrackDriverNode(Node):
             return False
         return self.has_shortcut_camera_decision(shortcut_cache)
 
-    def should_start_shortcut_check_before_group_confirm(self, now):
+    def should_start_shortcut_check_before_group_confirm(self, now, shortcut_cache):
         # 다음 신호등이 지름길 판단 신호등일 차례라면, 2초 group 확정 전이라도
-        # raw/trusted 신호등이 보이는 즉시 저속 판단 구간으로 들어간다.
+        # raw/trusted 신호등과 카메라 지름길 판단이 같이 잡힐 때만 저속 판단 구간으로 들어간다.
+        # 신호등만 보고 들어가면 middle/출구 신호를 shortcut 입구로 오인해 불필요하게 감속할 수 있다.
         if not SHORTCUT_CHECK_ENABLED or self.shortcut_done or self.shortcut_left_taken:
             return False
         if not (self.traffic_raw_visible or self.traffic_visible):
+            return False
+        if not self.has_shortcut_camera_decision(shortcut_cache):
             return False
         if self.route_signal_count >= ROUTE_SIGNAL_TOTAL:
             self.shortcut_done = True
@@ -1790,7 +1852,7 @@ class TrackDriverNode(Node):
         self.active_traffic_group = next_group
         self.traffic_last_visible_time = now
         self.traffic_group_armed = False
-        self.get_logger().info(
+        self.log_info(
             f"traffic group {next_group}/{TRAFFIC_GROUP_TOTAL} pending shortcut signal "
             f"{self.pending_shortcut_route_signal}/{ROUTE_SIGNAL_TOTAL} before 2s confirm: "
             f"source={source} raw_tl=({self.traffic_raw_class_id},"
@@ -1806,7 +1868,7 @@ class TrackDriverNode(Node):
         if not (self.traffic_raw_visible or self.traffic_visible):
             clear_elapsed = now - self.traffic_last_visible_time
             if clear_elapsed >= TRAFFIC_GROUP_CLEAR_TIME:
-                self.get_logger().warning(
+                self.log_warning(
                     f"pending shortcut group {self.pending_shortcut_group}/{TRAFFIC_GROUP_TOTAL} "
                     f"cancelled before 2s confirm clear={clear_elapsed:.2f}s"
                 )
@@ -1834,7 +1896,7 @@ class TrackDriverNode(Node):
         self.route_signal_last_clock = self.signal_clock
         self.pending_shortcut_group = 0
         self.pending_shortcut_route_signal = 0
-        self.get_logger().info(
+        self.log_info(
             f"traffic group {group}/{TRAFFIC_GROUP_TOTAL} -> shortcut signal "
             f"{self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} confirmed_after={visible_elapsed:.2f}s "
             f"(pending early check, group={old_group}->{self.traffic_group_count}, "
@@ -1858,7 +1920,7 @@ class TrackDriverNode(Node):
         self.route_signal_last_clock = self.signal_clock
         self.pending_shortcut_group = 0
         self.pending_shortcut_route_signal = 0
-        self.get_logger().info(
+        self.log_info(
             f"traffic group {group}/{TRAFFIC_GROUP_TOTAL} -> shortcut signal "
             f"{self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} force_confirmed: {reason} "
             f"(group={old_group}->{self.traffic_group_count}, "
@@ -1880,7 +1942,7 @@ class TrackDriverNode(Node):
 
         self.route_signal_count += 1
         self.route_signal_last_clock = self.signal_clock
-        self.get_logger().info(
+        self.log_info(
             f"traffic group {next_group}/{TRAFFIC_GROUP_TOTAL} "
             f"-> shortcut signal {self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} "
             f"claimed by camera before traffic light: "
@@ -1929,7 +1991,7 @@ class TrackDriverNode(Node):
 
         if self.traffic_group_count > TRAFFIC_GROUP_TOTAL:
             group_kind = "finish" if self.round_count >= ROUND_TOTAL else "extra"
-            self.get_logger().info(
+            self.log_info(
                 f"traffic group {self.traffic_group_count} ignored as {group_kind}: "
                 f"expected total={TRAFFIC_GROUP_TOTAL}"
             )
@@ -1938,14 +2000,14 @@ class TrackDriverNode(Node):
         if self.is_shortcut_traffic_group(self.traffic_group_count):
             self.route_signal_count += 1
             self.route_signal_last_clock = self.signal_clock
-            self.get_logger().info(
+            self.log_info(
                 f"traffic group {self.traffic_group_count}/{TRAFFIC_GROUP_TOTAL} "
                 f"-> shortcut signal {self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} "
                 f"confirmed_after={visible_elapsed:.2f}s"
             )
             return "shortcut"
 
-        self.get_logger().info(
+        self.log_info(
             f"traffic group {self.traffic_group_count}/{TRAFFIC_GROUP_TOTAL} "
             f"-> middle signal, straight route, round stays {self.round_count}/{ROUND_TOTAL} "
             f"confirmed_after={visible_elapsed:.2f}s"
@@ -1957,19 +2019,22 @@ class TrackDriverNode(Node):
         if self.is_middle_traffic_group(group):
             self.stop_overtake_monitor(f"middle signal group {group} passed")
             self.round_count = min(self.round_count + 1, ROUND_TOTAL)
-            self.get_logger().info(
+            self.log_info(
                 f"ROUND -> {self.round_count}/{ROUND_TOTAL} after middle signal group {group} passed"
             )
         elif group > 0:
-            self.get_logger().info(
+            self.log_info(
                 f"traffic group {group}/{TRAFFIC_GROUP_TOTAL} passed, round={self.round_count}/{ROUND_TOTAL}"
             )
         self.active_traffic_group = 0
         self.shortcut_straight_green_latched = False
+        self.reset_shortcut_slowdown()
 
     def start_cone(self, now):
+        if self.mission_log_start_time is None:
+            self.mission_log_start_time = now
         if self.cone_lane_driver is None:
-            self.get_logger().error("conedrive model is not ready; stopping before cone sequence")
+            self.log_error("conedrive model is not ready; stopping before cone sequence")
             self.set_state(STATE_STOP)
             self.drive(0.0, STOP_SPEED)
             return
@@ -1981,12 +2046,13 @@ class TrackDriverNode(Node):
             self.cornering_detector.reset()
         self.cone_move_start_time = None
         self.last_log_time = now
+        self.log_info("MODEL SWITCH WAIT_GREEN -> CONEDRIVE reason=start_green")
         self.set_state(STATE_CONE)
 
     def start_lane(self, now):
         self.last_log_time = now
         if self.lane_driver is None:
-            self.get_logger().error("lane driver is not ready; stopping after cone sequence")
+            self.log_error("lane driver is not ready; stopping after cone sequence")
             self.set_state(STATE_STOP)
             self.drive(0.0, STOP_SPEED)
             return
@@ -2020,21 +2086,24 @@ class TrackDriverNode(Node):
             self.cornering_detector.reset()
         self.reset_shortcut_cache()
         self.reset_shortcut_detectors()
+        self.reset_shortcut_slowdown()
         if self.traffic_visible:
-            self.get_logger().info(
+            self.log_info(
                 "route traffic counter waits until start traffic light is cleared"
             )
+        self.log_info("MODEL SWITCH CONEDRIVE -> LANE reason=cone_finished")
         self.set_state(STATE_LANE)
 
     def start_shortcut_check(self, now):
         if self.shortcut_detector is None or self.shortcut_lidar_detector is None or self.front_image is None:
             if self.current_shortcut_signal_index() >= ROUTE_SIGNAL_TOTAL:
                 self.shortcut_done = True
-            self.get_logger().warning("shortcut check skipped: camera/lidar detector or front camera is not ready")
+            self.log_warning("shortcut check skipped: camera/lidar detector or front camera is not ready")
             return
 
         self.reset_shortcut_cache()
         self.reset_shortcut_detectors()
+        self.reset_shortcut_slowdown()
         self.shortcut_open_votes = 0
         self.shortcut_blocked_votes = 0
         self.shortcut_none_votes = 0
@@ -2043,10 +2112,11 @@ class TrackDriverNode(Node):
         self.shortcut_check_last_report_time = 0.0
         self.last_log_time = now
         self.reset_lane_pulse()
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT_DETECT ON group={self.active_traffic_group}/{TRAFFIC_GROUP_TOTAL} "
             f"shortcut_signal={self.current_shortcut_signal_index()}/{ROUTE_SIGNAL_TOTAL} "
-            f"speed={SHORTCUT_CHECK_SPEED:.1f} threshold={SHORTCUT_OPEN_THRESHOLD:.2f} "
+            f"speed_ramp={SHORTCUT_SLOWDOWN_START_SPEED:.1f}->{SHORTCUT_CHECK_SPEED:.1f}/"
+            f"{SHORTCUT_SLOWDOWN_RAMP_TIME:.1f}s threshold={SHORTCUT_OPEN_THRESHOLD:.2f} "
             f"fusion_hold={SHORTCUT_FUSION_HOLD_TIME:.1f}s source=front_camera+lidar"
         )
         self.set_state(STATE_SHORTCUT_CHECK)
@@ -2058,7 +2128,7 @@ class TrackDriverNode(Node):
         self.last_log_time = now
         self.reset_lane_pulse()
         self.drive(0.0, STOP_SPEED)
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT_DETECT RESULT BLOCKED -> stop and wait only for green straight signal: {reason} "
             f"overtake_after_green={int(self.overtake_pending_after_green)}"
         )
@@ -2071,7 +2141,7 @@ class TrackDriverNode(Node):
         self.last_log_time = now
         self.reset_lane_pulse()
         self.drive(0.0, STOP_SPEED)
-        self.get_logger().info(
+        self.log_info(
             "SHORTCUT_DETECT RESULT OPEN -> stop and wait only for class 4 red_left signal"
         )
         self.set_state(STATE_SHORTCUT_WAIT_SIGNAL)
@@ -2082,9 +2152,10 @@ class TrackDriverNode(Node):
         self.stop_overtake_monitor("shortcut open, traffic light not visible")
         self.last_log_time = now
         self.reset_lane_pulse()
-        self.get_logger().warning(
+        self.log_warning(
             f"SHORTCUT_DETECT RESULT OPEN but traffic light is not trusted yet -> "
-            f"crawl with lane model speed={SHORTCUT_CHECK_SPEED:.1f}: {reason}"
+            f"crawl with lane model speed_ramp={SHORTCUT_SLOWDOWN_START_SPEED:.1f}->"
+            f"{SHORTCUT_CHECK_SPEED:.1f}/{SHORTCUT_SLOWDOWN_RAMP_TIME:.1f}s: {reason}"
         )
         self.set_state(STATE_SHORTCUT_WAIT_TRAFFIC)
 
@@ -2099,7 +2170,7 @@ class TrackDriverNode(Node):
         self.stop_overtake_monitor("shortcut drive selected")
         if self.shortcut_lane_driver is None:
             self.shortcut_done = self.route_signal_count >= ROUTE_SIGNAL_TOTAL
-            self.get_logger().warning("shortcut driving skipped: shortcut lane model is not ready")
+            self.log_warning("shortcut driving skipped: shortcut lane model is not ready")
             self.active_traffic_group = 0
             self.traffic_group_armed = True
             self.traffic_group_last_clock = self.signal_clock
@@ -2108,15 +2179,19 @@ class TrackDriverNode(Node):
             self.shortcut_red_left_latched = False
             self.reset_shortcut_cache()
             self.reset_shortcut_detectors()
+            self.reset_shortcut_slowdown()
             self.set_state(STATE_LANE)
             return
 
         self.shortcut_lane_driver.reset()
         self.reset_driver_angle_filter(self.shortcut_lane_driver)
         self.reset_lane_pulse()
+        self.reset_shortcut_slowdown()
         self.shortcut_left_taken = True
         self.last_log_time = now
-        self.get_logger().info("SHORTCUT_DETECT -> SHORTCUT_DRIVE model ON")
+        self.log_info(
+            f"MODEL SWITCH {self.state} -> SHORTCUT_DRIVE reason=shortcut_red_left"
+        )
         self.set_state(STATE_SHORTCUT_DRIVE)
 
     def run_cone(self, now):
@@ -2195,7 +2270,7 @@ class TrackDriverNode(Node):
     def handle_shortcut_signal_decision(self, now, shortcut_cache, source):
         shortcut_signal_index = self.current_shortcut_signal_index()
         if shortcut_signal_index == ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_DETECT skipped: first shortcut signal after cone is forced blocked "
                 f"source={source}; go straight only when green"
             )
@@ -2212,7 +2287,7 @@ class TrackDriverNode(Node):
             return False
 
         if self.shortcut_left_taken:
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_DETECT skipped: shortcut was already taken; "
                 f"source={source}; keep normal lane speed"
             )
@@ -2226,7 +2301,7 @@ class TrackDriverNode(Node):
 
         if last_chance:
             self.shortcut_force_wait_signal = True
-            self.get_logger().warning(
+            self.log_warning(
                 f"SHORTCUT_DETECT LAST CHANCE -> wait signal source={source}: "
                 f"2nd/3rd shortcut guarantee, not taken yet. "
                 f"avg_open={shortcut_cache['avg']:.2f} "
@@ -2237,7 +2312,7 @@ class TrackDriverNode(Node):
             self.start_shortcut_wait_signal_after_traffic_check(now, "last chance shortcut open")
             return True
 
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT_DETECT live check starts at shortcut signal source={source}: "
             f"ignore stale cache and crawl until YES/NO is confirmed"
         )
@@ -2259,7 +2334,7 @@ class TrackDriverNode(Node):
                 self.shortcut_done = True
         elif signal_kind == "middle":
             self.stop_overtake_monitor("middle signal reached")
-        elif self.should_start_shortcut_check_before_group_confirm(now):
+        elif self.should_start_shortcut_check_before_group_confirm(now, shortcut_cache):
             self.stop_overtake_monitor("shortcut raw traffic before group confirm")
             if self.start_shortcut_check_before_group_confirm(now, shortcut_cache, "traffic_raw"):
                 return
@@ -2277,11 +2352,27 @@ class TrackDriverNode(Node):
         if self.is_active_shortcut_signal() and self.green_visible:
             self.shortcut_straight_green_latched = True
 
+        if self.should_stop_after_shortcut_taken_for_signal(now):
+            if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
+                self.shortcut_check_last_report_time = now
+                self.log_info(
+                    f"SHORTCUT_AFTER_TAKEN_WAIT stop until green "
+                    f"group={self.active_traffic_group}/{TRAFFIC_GROUP_TOTAL} "
+                    f"next_group={self.traffic_group_count + 1}/{TRAFFIC_GROUP_TOTAL} "
+                    f"shortcut_signal={self.current_shortcut_signal_index()}/{ROUTE_SIGNAL_TOTAL} "
+                    f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f}) "
+                    f"raw_tl=({self.traffic_raw_class_id},{self.traffic_raw_class_name},"
+                    f"{self.traffic_raw_prob:.2f})"
+                )
+            self.reset_lane_pulse()
+            self.drive(0.0, STOP_SPEED)
+            return
+
         # 지름길 판단 신호등에서 직진 루트로 갈 때도 초록불 전에는 절대 진행하지 않는다.
         if self.should_stop_for_active_shortcut_non_green():
             if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
                 self.shortcut_check_last_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"SHORTCUT_STRAIGHT_WAIT stop until green "
                     f"group={self.active_traffic_group}/{TRAFFIC_GROUP_TOTAL} "
                     f"shortcut_signal={self.current_shortcut_signal_index()}/{ROUTE_SIGNAL_TOTAL} "
@@ -2293,14 +2384,22 @@ class TrackDriverNode(Node):
             self.drive(0.0, STOP_SPEED)
             return
 
-        # 중간 신호등이나 예상 밖 일반 빨간불은 신호위반 방지를 위해 정지한다.
-        if self.red_visible and not self.is_active_shortcut_signal():
+        # middle 신호등은 무시하고 통과한다. 그 외 예상 밖 일반 빨간불은 정지한다.
+        if (
+            self.red_visible
+            and not self.is_active_shortcut_signal()
+            and not self.is_active_middle_signal()
+        ):
             self.reset_lane_pulse()
             self.drive(0.0, STOP_SPEED)
             return
 
         if self.should_crawl_for_shortcut_signal_approach(now):
-            self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+            self.run_model_drive(
+                self.lane_driver,
+                now,
+                speed_limit=self.shortcut_slowdown_speed_limit(now),
+            )
             return
 
         if self.update_overtake_monitor(now):
@@ -2317,6 +2416,7 @@ class TrackDriverNode(Node):
             self.run_model_drive(self.lane_driver, now, speed_limit=CORNERING_DRIVE_SPEED)
             return
 
+        self.reset_shortcut_slowdown()
         self.run_model_drive(self.lane_driver, now)
 
     def run_shortcut_check(self, now):
@@ -2324,7 +2424,8 @@ class TrackDriverNode(Node):
         self.confirm_pending_shortcut_group_if_ready(now)
         if self.try_start_overtake_from_shortcut(now):
             return
-        self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+        shortcut_speed_limit = self.shortcut_slowdown_speed_limit(now)
+        self.run_model_drive(self.lane_driver, now, speed_limit=shortcut_speed_limit)
 
         fusion = self.update_shortcut_fusion(now)
         camera = fusion["camera"]
@@ -2332,8 +2433,9 @@ class TrackDriverNode(Node):
         elapsed = now - self.state_start_time
         if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
             self.shortcut_check_last_report_time = now
-            self.get_logger().info(
-                f"SHORTCUT_DETECT running elapsed={elapsed:.2f}s speed={SHORTCUT_CHECK_SPEED:.1f} "
+            self.log_info(
+                f"SHORTCUT_DETECT running elapsed={elapsed:.2f}s "
+                f"speed_limit={shortcut_speed_limit:.1f}->{SHORTCUT_CHECK_SPEED:.1f} "
                 f"reason={fusion['reason']} traffic={int(fusion['traffic_ready'])} "
                 f"camera=({camera['trusted']}/{camera['raw']},"
                 f"o={camera['open_prob']:.2f},b={camera['blocked_prob']:.2f},n={camera['none_prob']:.2f}) "
@@ -2348,7 +2450,7 @@ class TrackDriverNode(Node):
             return
 
         if fusion["open"]:
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_DETECT RESULT OPEN by camera+lidar fusion "
                 f"avg_open={fusion['avg_open']:.2f} traffic_visible={int(self.traffic_visible)}"
             )
@@ -2357,7 +2459,7 @@ class TrackDriverNode(Node):
 
         if self.current_shortcut_signal_index() >= ROUTE_SIGNAL_TOTAL:
             self.shortcut_done = True
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT_DETECT RESULT BLOCKED by camera+lidar fusion "
             f"avg_open={fusion['avg_open']:.2f} traffic_visible={int(self.traffic_visible)}"
         )
@@ -2379,9 +2481,14 @@ class TrackDriverNode(Node):
                         now,
                         "first shortcut signal fixed blocked and green straight",
                     )
+                    self.reset_shortcut_slowdown()
                     self.run_model_drive(self.lane_driver, now)
                 else:
-                    self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+                    self.run_model_drive(
+                        self.lane_driver,
+                        now,
+                        speed_limit=self.shortcut_slowdown_speed_limit(now),
+                    )
             else:
                 if self.should_crawl_first_shortcut_wait_green(now):
                     self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
@@ -2392,7 +2499,7 @@ class TrackDriverNode(Node):
 
         if self.green_visible:
             self.shortcut_straight_green_latched = True
-            self.get_logger().info(
+            self.log_info(
                 f"green straight signal detected -> normal lane drive "
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f})"
             )
@@ -2403,14 +2510,19 @@ class TrackDriverNode(Node):
                 self.stop_overtake_monitor("green wait finished without overtake segment")
             self.set_state(STATE_LANE)
             if self.current_shortcut_signal_index() == ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
+                self.reset_shortcut_slowdown()
                 self.run_model_drive(self.lane_driver, now)
             else:
-                self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+                self.run_model_drive(
+                    self.lane_driver,
+                    now,
+                    speed_limit=self.shortcut_slowdown_speed_limit(now),
+                )
             return
 
         if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
             self.shortcut_check_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_WAIT_GREEN elapsed={elapsed:.2f}s "
                 f"traffic_visible={int(self.traffic_visible)} red={int(self.red_visible)} "
                 f"green={int(self.green_visible)} arrow={int(self.left_arrow_visible)} "
@@ -2428,7 +2540,7 @@ class TrackDriverNode(Node):
         if self.try_start_overtake_from_shortcut(now):
             return
         if self.traffic_visible:
-            self.get_logger().info(
+            self.log_info(
                 f"traffic light found after shortcut YES -> stop and wait for class 4 red_left "
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f}) "
                 f"raw_tl=({self.traffic_raw_class_id},{self.traffic_raw_class_name},{self.traffic_raw_prob:.2f})"
@@ -2439,15 +2551,19 @@ class TrackDriverNode(Node):
         elapsed = now - self.state_start_time
         if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
             self.shortcut_check_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_WAIT_TRAFFIC elapsed={elapsed:.2f}s "
                 f"traffic_visible={int(self.traffic_visible)} raw_visible={int(self.traffic_raw_visible)} "
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f}) "
                 f"raw_tl=({self.traffic_raw_class_id},{self.traffic_raw_class_name},{self.traffic_raw_prob:.2f}) "
-                f"lane_speed_limit={SHORTCUT_CHECK_SPEED:.1f}"
+                f"lane_speed_limit={self.shortcut_slowdown_speed_limit(now):.1f}->{SHORTCUT_CHECK_SPEED:.1f}"
             )
 
-        self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+        self.run_model_drive(
+            self.lane_driver,
+            now,
+            speed_limit=self.shortcut_slowdown_speed_limit(now),
+        )
 
     def run_shortcut_wait_signal(self, now):
         self.confirm_pending_shortcut_group_if_ready(now)
@@ -2462,7 +2578,7 @@ class TrackDriverNode(Node):
         if self.left_arrow_visible or self.shortcut_red_left_latched:
             self.shortcut_red_left_latched = True
             self.shortcut_force_wait_signal = False
-            self.get_logger().info(
+            self.log_info(
                 f"red_left class 4 latched -> ignore later signal changes and shortcut drive "
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f})"
             )
@@ -2472,7 +2588,7 @@ class TrackDriverNode(Node):
         elapsed = now - self.state_start_time
         if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
             self.shortcut_check_last_report_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT_WAIT_SIGNAL elapsed={elapsed:.2f}s "
                 f"traffic_visible={int(self.traffic_visible)} red={int(self.red_visible)} "
                 f"green={int(self.green_visible)} arrow={int(self.left_arrow_visible)} "
@@ -2486,24 +2602,34 @@ class TrackDriverNode(Node):
         self.drive(0.0, STOP_SPEED)
 
     def run_shortcut_drive(self, now):
-        elapsed = now - self.state_start_time
-        if elapsed >= SHORTCUT_DRIVE_MAX_TIME:
-            self.shortcut_done = self.route_signal_count >= ROUTE_SIGNAL_TOTAL
-            self.get_logger().info("shortcut drive timeout -> normal lane model")
-            self.lane_driver.reset()
-            self.reset_driver_angle_filter(self.lane_driver)
-            self.reset_lane_pulse()
-            self.lane_start_time = now
-            self.active_traffic_group = 0
-            self.traffic_group_armed = True
-            self.traffic_group_last_clock = self.signal_clock
-            self.traffic_last_visible_time = 0.0
-            self.reset_shortcut_cache()
-            self.reset_shortcut_detectors()
-            self.set_state(STATE_LANE)
+        if self.schoolzone_active:
+            elapsed = now - self.state_start_time
+            self.finish_shortcut_drive(
+                now,
+                f"schoolzone_detected elapsed={elapsed:.2f}s "
+                f"det=({self.schoolzone_raw_class_id},{self.schoolzone_raw_class_name},"
+                f"{self.schoolzone_raw_prob:.2f})",
+            )
             return
 
         self.run_model_drive(self.shortcut_lane_driver, now)
+
+    def finish_shortcut_drive(self, now, reason):
+        self.shortcut_done = self.route_signal_count >= ROUTE_SIGNAL_TOTAL
+        if self.lane_driver is not None:
+            self.lane_driver.reset()
+            self.reset_driver_angle_filter(self.lane_driver)
+        self.reset_lane_pulse()
+        self.lane_start_time = now
+        self.active_traffic_group = 0
+        self.traffic_group_armed = True
+        self.traffic_group_last_clock = self.signal_clock
+        self.traffic_last_visible_time = 0.0
+        self.reset_shortcut_cache()
+        self.reset_shortcut_detectors()
+        self.reset_shortcut_slowdown()
+        self.log_info(f"MODEL SWITCH SHORTCUT_DRIVE -> LANE reason={reason}")
+        self.set_state(STATE_LANE)
 
     def run_overtake_drive(self, now):
         # 추월 구간은 지름길/신호등 정책과 독립이다. 이 상태에서는 group/shortcut 판단을 호출하지 않는다.
@@ -2625,7 +2751,7 @@ class TrackDriverNode(Node):
         if self.traffic_candidate_start_time is not None:
             traffic_hold = now - self.traffic_candidate_start_time
 
-        self.get_logger().info(
+        self.log_info(
             f"[{self.state}] green={int(green)} red={int(self.red_visible)} "
             f"arrow={int(self.left_arrow_visible)} visible={int(self.traffic_visible)} "
             f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f}) "

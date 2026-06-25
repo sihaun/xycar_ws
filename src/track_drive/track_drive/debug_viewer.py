@@ -9,11 +9,13 @@
 import argparse
 import os
 import time
+from datetime import datetime
 
 import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
+from rcl_interfaces.msg import Log
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, LaserScan
@@ -23,11 +25,13 @@ try:
     from track_drive.shortcut_drive import ShortcutCameraDetector, ShortcutDetector, make_occupancy_image
     from track_drive.overtake_drive import CLASS_OVERTAKE, OvertakeCameraDetector
     from track_drive.corner_drive import CLASS_CORNERING, CorneringCameraDetector
+    from track_drive.track_drive import CLASS_SCHOOLZONE, SchoolZoneCameraDetector
 except ImportError:
     from traffic_light_model import CLASS_NONE, CLASS_NAMES as TRAFFIC_CLASS_NAMES, TrafficLightClassifier
     from shortcut_drive import ShortcutCameraDetector, ShortcutDetector, make_occupancy_image
     from overtake_drive import CLASS_OVERTAKE, OvertakeCameraDetector
     from corner_drive import CLASS_CORNERING, CorneringCameraDetector
+    from track_drive import CLASS_SCHOOLZONE, SchoolZoneCameraDetector
 
 
 DEFAULT_TRAFFIC_MODEL_PATH = "/home/xytron/xycar_ws/TrafficLight/best_traffic_light_resnet18.pth"
@@ -35,10 +39,12 @@ DEFAULT_SHORTCUT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect/be
 DEFAULT_SHORTCUT_CAMERA_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect_cam/best_shortcut_cam_resnet18.pth"
 DEFAULT_OVERTAKE_MODEL_PATH = "/home/xytron/xycar_ws/Overtake/overtake_detect_cam/best_overtake_detect_cam_resnet18.pth"
 DEFAULT_CORNERING_MODEL_PATH = "/home/xytron/xycar_ws/Cornering/corner_detect/best_corner_detect_resnet18.pth"
+DEFAULT_SCHOOLZONE_MODEL_PATH = "/home/xytron/xycar_ws/SchoolZone/schoolzone_detect/best_schoolzone_resnet18.pth"
 DEFAULT_CAMERA_TOPIC = "/usb_cam/image_raw/front"
 DEFAULT_SCAN_TOPIC = "/scan"
 DEFAULT_CROP = (160, 20, 360, 170)
 DEBUG_WINDOW_NAME = "Mission Debug"
+DRIVER_LOG_NAMES = {"driver", "track_drive"}
 
 CLASS_GREEN = 3
 CLASS_RED_LEFT = 4
@@ -60,12 +66,15 @@ class MissionDebugViewer(Node):
         self.bridge = CvBridge()
         self.should_exit = False
         self.show_enabled = True
+        self.node_log_start_time = time.monotonic()
+        self.mission_log_start_time = None
 
         self.last_report_time = 0.0
         self.last_lidar_report_time = 0.0
         self.last_shortcut_camera_report_time = 0.0
         self.last_overtake_report_time = 0.0
         self.last_cornering_report_time = 0.0
+        self.last_schoolzone_report_time = 0.0
         self.traffic_visible = False
         self.candidate_start_time = None
         self.signal_count = 0
@@ -76,6 +85,10 @@ class MissionDebugViewer(Node):
         self.last_visible_time = 0.0
         self.last_signal_class_id = CLASS_NONE
         self.last_signal_probability = 0.0
+        self.driver_model_state = "WAIT"
+        self.driver_last_switch = "none"
+        self.driver_last_switch_time = 0.0
+        self.driver_last_switch_text = ""
 
         self.cone_started = False
         self.cone_finished = False
@@ -113,6 +126,12 @@ class MissionDebugViewer(Node):
         self.cornering_clear_start_time = None
         self.cornering_segment_active = False
         self.cornering_segment_start_time = None
+        self.schoolzone_raw_class_id = 0
+        self.schoolzone_raw_class_name = "none"
+        self.schoolzone_raw_prob = 0.0
+        self.schoolzone_candidate_start_time = None
+        self.schoolzone_held = 0.0
+        self.schoolzone_active = False
         self.latest_traffic_view = self.make_traffic_view(
             np.zeros((120, 220, 3), dtype=np.uint8),
             0,
@@ -151,29 +170,50 @@ class MissionDebugViewer(Node):
             device=args.device,
             inference_period=args.cornering_inference_period,
         )
+        self.schoolzone_detector = SchoolZoneCameraDetector(
+            model_path=args.schoolzone_model,
+            device=args.device,
+            inference_period=args.schoolzone_inference_period,
+        )
 
         if not os.environ.get("DISPLAY"):
             self.show_enabled = False
-            self.get_logger().warning("DISPLAY is not set; OpenCV windows disabled, CLI logs only")
+            self.log_warning("DISPLAY is not set; OpenCV windows disabled, CLI logs only")
         if self.show_enabled:
             try:
                 cv2.namedWindow(DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
                 self.show_debug_window()
             except cv2.error as exc:
                 self.show_enabled = False
-                self.get_logger().error(f"OpenCV window failed: {exc}; CLI logs only")
+                self.log_error(f"OpenCV window failed: {exc}; CLI logs only")
 
         self.create_subscription(Image, args.camera_topic, self.image_callback, qos_profile_sensor_data)
         self.create_subscription(LaserScan, args.scan_topic, self.scan_callback, qos_profile_sensor_data)
+        self.create_subscription(Log, "/rosout", self.rosout_callback, 10)
         self.create_timer(0.05, self.timer_callback)
-        self.get_logger().info(
-            "debug viewer started: traffic + shortcut camera/lidar + overtake/cornering camera events"
+        self.log_info(
+            "debug viewer started: traffic + shortcut camera/lidar + "
+            "overtake/cornering/schoolzone camera events"
         )
 
     def destroy_node(self):
         if self.show_enabled:
             cv2.destroyAllWindows()
         super().destroy_node()
+
+    def log_prefix(self):
+        base_time = self.mission_log_start_time or self.node_log_start_time
+        elapsed = time.monotonic() - base_time
+        return f"[KST {datetime.now().strftime('%H:%M:%S')}] [T+{elapsed:07.2f}s]"
+
+    def log_info(self, message):
+        self.get_logger().info(f"{self.log_prefix()} {message}")
+
+    def log_warning(self, message):
+        self.get_logger().warning(f"{self.log_prefix()} {message}")
+
+    def log_error(self, message):
+        self.get_logger().error(f"{self.log_prefix()} {message}")
 
     def image_callback(self, msg):
         image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -199,7 +239,7 @@ class MissionDebugViewer(Node):
         if self.args.log_all and new_overtake_inference:
             if now - self.last_overtake_report_time >= self.args.report_period:
                 self.last_overtake_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"RAW overtake_camera=({overtake_class_id},{overtake_class_name},{overtake_prob:.2f})"
                 )
 
@@ -214,8 +254,24 @@ class MissionDebugViewer(Node):
         if self.args.log_all and new_cornering_inference:
             if now - self.last_cornering_report_time >= self.args.report_period:
                 self.last_cornering_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"RAW cornering_camera=({cornering_class_id},{cornering_class_name},{cornering_prob:.2f})"
+                )
+
+        prev_schoolzone_infer_time = self.schoolzone_detector.last_infer_time
+        schoolzone_class_id, schoolzone_prob, schoolzone_class_name = self.schoolzone_detector.process(image, now)
+        new_schoolzone_inference = self.schoolzone_detector.last_infer_time > prev_schoolzone_infer_time
+        self.schoolzone_raw_class_id = schoolzone_class_id
+        self.schoolzone_raw_class_name = schoolzone_class_name
+        self.schoolzone_raw_prob = schoolzone_prob
+        self.update_schoolzone_event_log(now)
+
+        if self.args.log_all and new_schoolzone_inference:
+            if now - self.last_schoolzone_report_time >= self.args.report_period:
+                self.last_schoolzone_report_time = now
+                self.log_info(
+                    f"RAW schoolzone_camera=({schoolzone_class_id},{schoolzone_class_name},"
+                    f"{schoolzone_prob:.2f})"
                 )
 
         prev_shortcut_cam_infer_time = self.shortcut_camera_detector.last_infer_time
@@ -231,7 +287,7 @@ class MissionDebugViewer(Node):
         if self.args.log_all and new_shortcut_cam_inference:
             if now - self.last_shortcut_camera_report_time >= self.args.report_period:
                 self.last_shortcut_camera_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"RAW shortcut_camera={self.shortcut_cam_raw_class_name} "
                     f"open={self.shortcut_cam_raw_open_prob:.2f} "
                     f"blocked={self.shortcut_cam_raw_blocked_prob:.2f} "
@@ -241,6 +297,74 @@ class MissionDebugViewer(Node):
         if self.show_enabled:
             self.latest_front_view = self.make_front_camera_view(image)
             self.show_debug_window()
+
+    def rosout_callback(self, msg):
+        if msg.name not in DRIVER_LOG_NAMES:
+            return
+        if "MODEL SWITCH" not in msg.msg:
+            return
+
+        now = time.monotonic()
+        switch_text = msg.msg[msg.msg.find("MODEL SWITCH"):]
+        if switch_text == self.driver_last_switch_text and now - self.driver_last_switch_time < 0.5:
+            return
+
+        self.driver_last_switch_text = switch_text
+        self.driver_last_switch_time = now
+        self.driver_last_switch = switch_text
+        self.driver_model_state = self.parse_model_switch_target(switch_text)
+        self.apply_driver_model_switch(switch_text, now)
+        self.log_info(f"DRIVER {switch_text}")
+
+    def parse_model_switch_target(self, switch_text):
+        try:
+            after = switch_text.split("MODEL SWITCH", 1)[1].strip()
+            if "->" not in after:
+                return self.driver_model_state
+            target = after.split("->", 1)[1].strip()
+            return target.split()[0]
+        except Exception:
+            return self.driver_model_state
+
+    def apply_driver_model_switch(self, switch_text, now):
+        if "WAIT_GREEN -> CONEDRIVE" in switch_text and self.mission_log_start_time is None:
+            self.mission_log_start_time = now
+
+        if "-> SHORTCUT_DRIVE" in switch_text:
+            self.shortcut_segment_active = True
+            self.shortcut_segment_group = self.current_group
+            self.shortcut_segment_start_time = now
+            self.overtake_segment_active = False
+            self.cornering_segment_active = False
+            return
+
+        if "SHORTCUT_DRIVE -> LANE" in switch_text:
+            self.shortcut_segment_active = False
+            self.shortcut_segment_start_time = None
+            return
+
+        if "-> OVERTAKE_DRIVE" in switch_text:
+            self.overtake_segment_active = True
+            self.overtake_segment_start_time = now
+            self.shortcut_segment_active = False
+            self.cornering_segment_active = False
+            return
+
+        if "OVERTAKE_DRIVE -> LANE" in switch_text:
+            self.overtake_segment_active = False
+            self.overtake_segment_start_time = None
+            return
+
+        if "-> CORNER_DRIVE" in switch_text:
+            self.cornering_segment_active = True
+            self.cornering_segment_start_time = now
+            self.shortcut_segment_active = False
+            self.overtake_segment_active = False
+            return
+
+        if "CORNER_DRIVE -> LANE" in switch_text:
+            self.cornering_segment_active = False
+            self.cornering_segment_start_time = None
 
     def scan_callback(self, msg):
         now = time.monotonic()
@@ -261,7 +385,7 @@ class MissionDebugViewer(Node):
         if self.args.log_all and new_shortcut_inference:
             if now - self.last_lidar_report_time >= self.args.report_period:
                 self.last_lidar_report_time = now
-                self.get_logger().info(
+                self.log_info(
                     f"RAW lidar shortcut={self.lidar_raw_class_name} "
                     f"shortcut_open={self.lidar_raw_open_prob:.2f} "
                     f"shortcut_blocked={self.lidar_raw_blocked_prob:.2f}"
@@ -276,23 +400,27 @@ class MissionDebugViewer(Node):
         if self.cone_started and not self.cone_finished and self.cone_start_time is not None:
             if now - self.cone_start_time >= self.args.cone_seconds:
                 self.cone_finished = True
-                self.get_logger().info(
+                self.log_info(
                     f"CONE END -> LANE START elapsed={now - self.cone_start_time:.2f}s"
                 )
-                self.get_logger().info(
-                    "MODEL SWITCH CONEDRIVE -> LANE reason=cone_finished"
+                self.log_info(
+                    "VIEWER INFER MODEL SWITCH CONEDRIVE -> LANE reason=cone_finished"
                 )
 
-        if self.shortcut_segment_active and self.shortcut_segment_start_time is not None:
+        if (
+            self.args.shortcut_segment_max_time > 0.0
+            and self.shortcut_segment_active
+            and self.shortcut_segment_start_time is not None
+        ):
             if now - self.shortcut_segment_start_time >= self.args.shortcut_segment_max_time:
                 elapsed = now - self.shortcut_segment_start_time
                 self.shortcut_segment_active = False
-                self.get_logger().info(
+                self.log_info(
                     f"SHORTCUT SEGMENT EXIT inferred_by_timeout "
                     f"group={self.group_label(self.shortcut_segment_group)} elapsed={elapsed:.2f}s"
                 )
-                self.get_logger().info(
-                    "MODEL SWITCH SHORTCUT_DRIVE -> LANE reason=shortcut_timeout"
+                self.log_info(
+                    "VIEWER INFER MODEL SWITCH SHORTCUT_DRIVE -> LANE reason=shortcut_timeout"
                 )
 
     def update_shortcut_lidar_event_log(self, now):
@@ -319,7 +447,7 @@ class MissionDebugViewer(Node):
 
         self.lidar_trusted_class_name = self.lidar_candidate_class_name
         decision = "YES" if self.lidar_trusted_class_name == "open" else "NO"
-        self.get_logger().info(
+        self.log_info(
             f"LIDAR SHORTCUT -> {decision} "
             f"class={self.lidar_trusted_class_name} "
             f"open={self.lidar_raw_open_prob:.2f} blocked={self.lidar_raw_blocked_prob:.2f} "
@@ -330,14 +458,14 @@ class MissionDebugViewer(Node):
         if self.is_shortcut_group(self.current_group):
             if self.lidar_trusted_class_name == "open" and self.shortcut_open_logged_group != self.current_group:
                 self.shortcut_open_logged_group = self.current_group
-                self.get_logger().info(
+                self.log_info(
                     f"SHORTCUT ROAD OPEN group={self.group_label(self.current_group)} "
                     "waiting for red_left signal"
                 )
                 self.try_enter_shortcut_segment(now, "lidar_yes")
             elif self.lidar_trusted_class_name == "blocked" and self.shortcut_blocked_logged_group != self.current_group:
                 self.shortcut_blocked_logged_group = self.current_group
-                self.get_logger().info(
+                self.log_info(
                     f"SHORTCUT ROAD BLOCKED group={self.group_label(self.current_group)} "
                     "normal route expected"
                 )
@@ -365,13 +493,13 @@ class MissionDebugViewer(Node):
 
             self.overtake_segment_active = True
             self.overtake_segment_start_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"OVERTAKE SEGMENT ENTER source=front_cam "
                 f"det=({self.overtake_raw_class_id},{self.overtake_raw_class_name},{self.overtake_raw_prob:.2f}) "
                 f"held={held:.2f}s"
             )
-            self.get_logger().info(
-                "MODEL SWITCH LANE -> OVERTAKE_DRIVE reason=overtake_yes_confirmed"
+            self.log_info(
+                "VIEWER INFER MODEL SWITCH LANE -> OVERTAKE_DRIVE reason=overtake_yes_confirmed"
             )
             return
 
@@ -388,11 +516,11 @@ class MissionDebugViewer(Node):
         self.overtake_segment_active = False
         self.overtake_segment_start_time = None
         self.overtake_clear_start_time = None
-        self.get_logger().info(
+        self.log_info(
             f"OVERTAKE SEGMENT EXIT source=front_cam_clear elapsed={elapsed:.2f}s"
         )
-        self.get_logger().info(
-            "MODEL SWITCH OVERTAKE_DRIVE -> LANE reason=overtake_no_confirmed"
+        self.log_info(
+            "VIEWER INFER MODEL SWITCH OVERTAKE_DRIVE -> LANE reason=overtake_no_confirmed"
         )
 
     def update_cornering_event_log(self, now):
@@ -420,13 +548,13 @@ class MissionDebugViewer(Node):
 
             self.cornering_segment_active = True
             self.cornering_segment_start_time = now
-            self.get_logger().info(
+            self.log_info(
                 f"CORNERING SEGMENT ENTER source=front_cam "
                 f"det=({self.cornering_raw_class_id},{self.cornering_raw_class_name},{self.cornering_raw_prob:.2f}) "
                 f"held={held:.2f}s"
             )
-            self.get_logger().info(
-                "MODEL SWITCH LANE -> CORNER_DRIVE reason=cornering_yes_confirmed"
+            self.log_info(
+                "VIEWER INFER MODEL SWITCH LANE -> CORNER_DRIVE reason=cornering_yes_confirmed"
             )
             return
 
@@ -443,11 +571,38 @@ class MissionDebugViewer(Node):
         self.cornering_segment_active = False
         self.cornering_segment_start_time = None
         self.cornering_clear_start_time = None
-        self.get_logger().info(
+        self.log_info(
             f"CORNERING SEGMENT EXIT source=front_cam_clear elapsed={elapsed:.2f}s"
         )
-        self.get_logger().info(
-            "MODEL SWITCH CORNER_DRIVE -> LANE reason=cornering_no_confirmed"
+        self.log_info(
+            "VIEWER INFER MODEL SWITCH CORNER_DRIVE -> LANE reason=cornering_no_confirmed"
+        )
+
+    def update_schoolzone_event_log(self, now):
+        is_schoolzone = (
+            self.schoolzone_raw_class_id == CLASS_SCHOOLZONE
+            and self.schoolzone_raw_prob >= self.args.schoolzone_prob
+        )
+
+        if is_schoolzone:
+            if self.schoolzone_candidate_start_time is None:
+                self.schoolzone_candidate_start_time = now
+            self.schoolzone_held = now - self.schoolzone_candidate_start_time
+        else:
+            self.schoolzone_candidate_start_time = None
+            self.schoolzone_held = 0.0
+
+        confirmed = is_schoolzone and self.schoolzone_held >= self.args.schoolzone_trust_time
+        if confirmed == self.schoolzone_active:
+            return
+
+        self.schoolzone_active = confirmed
+        decision = "YES" if confirmed else "NO"
+        self.log_info(
+            f"SCHOOLZONE -> {decision} source=front_cam "
+            f"held={self.schoolzone_held:.2f}/{self.args.schoolzone_trust_time:.2f}s "
+            f"det=({self.schoolzone_raw_class_id},{self.schoolzone_raw_class_name},"
+            f"{self.schoolzone_raw_prob:.2f}) threshold={self.args.schoolzone_prob:.2f}"
         )
 
     def update_traffic_event_log(self, class_id, probability, class_name, probs, now):
@@ -494,7 +649,7 @@ class MissionDebugViewer(Node):
 
         self.last_shortcut_zone_group = next_group
         elapsed = now - (self.candidate_start_time or now)
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT DECISION ZONE ENTER group={self.group_label(next_group)} "
             f"round={self.round_count}/{self.args.round_total} mode=early "
             f"raw_signal=({class_id},{class_name},{probability:.2f}) seen={elapsed:.2f}s"
@@ -517,10 +672,10 @@ class MissionDebugViewer(Node):
         if kind == "middle" and self.shortcut_segment_active:
             self.exit_shortcut_segment(now, "middle_signal_found")
 
-        self.get_logger().info(
+        self.log_info(
             f"GROUP -> {self.group_label(self.current_group)} kind={kind}"
         )
-        self.get_logger().info(
+        self.log_info(
             f"TRAFFIC FOUND group={self.group_label(self.current_group)} "
             f"kind={kind} signal=({class_id},{class_name},{probability:.2f}) "
             f"confirmed_after={confirmed_after:.2f}s"
@@ -528,7 +683,7 @@ class MissionDebugViewer(Node):
 
         if kind == "shortcut" and self.last_shortcut_zone_group != self.current_group:
             self.last_shortcut_zone_group = self.current_group
-            self.get_logger().info(
+            self.log_info(
                 f"SHORTCUT DECISION ZONE ENTER group={self.group_label(self.current_group)} "
                 f"round={self.round_count}/{self.args.round_total}"
             )
@@ -541,7 +696,7 @@ class MissionDebugViewer(Node):
         signal_name = self.class_name(self.last_signal_class_id)
         visible_duration = max(0.0, self.last_visible_time - self.light_first_seen_time)
         clear_delay = max(0.0, now - self.last_visible_time)
-        self.get_logger().info(
+        self.log_info(
             f"TRAFFIC PASSED group={self.group_label(group)} kind={kind} "
             f"last_signal=({self.last_signal_class_id},{signal_name},"
             f"{self.last_signal_probability:.2f}) visible={visible_duration:.2f}s "
@@ -550,7 +705,7 @@ class MissionDebugViewer(Node):
 
         if self.is_middle_group(group):
             self.round_count = min(self.round_count + 1, self.args.round_total)
-            self.get_logger().info(
+            self.log_info(
                 f"ROUND -> {self.round_count}/{self.args.round_total} "
                 f"(after middle signal group={group})"
             )
@@ -566,7 +721,7 @@ class MissionDebugViewer(Node):
         old_prob = self.last_signal_probability
         self.last_signal_class_id = class_id
         self.last_signal_probability = probability
-        self.get_logger().info(
+        self.log_info(
             f"SIGNAL CHANGE group={self.group_label(self.current_group)} "
             f"({old_id},{old_name},{old_prob:.2f}) -> "
             f"({class_id},{class_name},{probability:.2f})"
@@ -577,12 +732,14 @@ class MissionDebugViewer(Node):
         if self.current_group == 0 and class_id == CLASS_GREEN and not self.cone_started:
             self.cone_started = True
             self.cone_start_time = now
-            self.get_logger().info(
+            if self.mission_log_start_time is None:
+                self.mission_log_start_time = now
+            self.log_info(
                 f"CONE START inferred_from_start_green "
                 f"signal=({class_id},{class_name},{probability:.2f})"
             )
-            self.get_logger().info(
-                "MODEL SWITCH WAIT_GREEN -> CONEDRIVE reason=start_green"
+            self.log_info(
+                "VIEWER INFER MODEL SWITCH WAIT_GREEN -> CONEDRIVE reason=start_green"
             )
             return
 
@@ -604,24 +761,24 @@ class MissionDebugViewer(Node):
         self.shortcut_segment_active = True
         self.shortcut_segment_group = self.current_group
         self.shortcut_segment_start_time = now
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT SEGMENT ENTER group={self.group_label(self.current_group)} "
             f"reason={reason} signal=red_left lidar=YES"
         )
-        self.get_logger().info(
-            "MODEL SWITCH LANE -> SHORTCUT_DRIVE reason=shortcut_red_left"
+        self.log_info(
+            "VIEWER INFER MODEL SWITCH LANE -> SHORTCUT_DRIVE reason=shortcut_red_left"
         )
 
     def exit_shortcut_segment(self, now, reason):
         elapsed = now - self.shortcut_segment_start_time if self.shortcut_segment_start_time else 0.0
         self.shortcut_segment_active = False
         self.shortcut_segment_start_time = None
-        self.get_logger().info(
+        self.log_info(
             f"SHORTCUT SEGMENT EXIT reason={reason} "
             f"group={self.group_label(self.shortcut_segment_group)} elapsed={elapsed:.2f}s"
         )
-        self.get_logger().info(
-            f"MODEL SWITCH SHORTCUT_DRIVE -> LANE reason={reason}"
+        self.log_info(
+            f"VIEWER INFER MODEL SWITCH SHORTCUT_DRIVE -> LANE reason={reason}"
         )
 
     def log_raw_class(self, class_id, probability, class_name, probs):
@@ -630,7 +787,7 @@ class MissionDebugViewer(Node):
             for index, name in enumerate(TRAFFIC_CLASS_NAMES)
             if index < len(probs)
         )
-        self.get_logger().info(
+        self.log_info(
             f"RAW traffic_light class=({class_id},{class_name},{probability:.2f}) {prob_text}"
         )
 
@@ -818,6 +975,19 @@ class MissionDebugViewer(Node):
         cornering_active = "ON" if self.cornering_segment_active else "off"
         cornering_color = (0, 255, 255) if self.cornering_segment_active else (0, 255, 0) if cornering_yes else (80, 80, 255)
 
+        schoolzone_raw_yes = (
+            self.schoolzone_raw_class_id == CLASS_SCHOOLZONE
+            and self.schoolzone_raw_prob >= self.args.schoolzone_prob
+        )
+        schoolzone_status = "YES" if self.schoolzone_active else "raw" if schoolzone_raw_yes else "NO"
+        schoolzone_color = (
+            (0, 255, 0)
+            if self.schoolzone_active
+            else (0, 200, 255)
+            if schoolzone_raw_yes
+            else (80, 80, 255)
+        )
+
         shortcut_name = self.shortcut_cam_raw_class_name
         if shortcut_name == "open" and self.shortcut_cam_raw_open_prob >= self.args.shortcut_open_threshold:
             shortcut_status = "YES"
@@ -829,7 +999,7 @@ class MissionDebugViewer(Node):
             shortcut_status = "NONE"
             shortcut_color = (210, 210, 210)
 
-        overlay_h = 154
+        overlay_h = 210
         cv2.rectangle(view, (0, 0), (view.shape[1], overlay_h), (0, 0, 0), -1)
         self.put_status_row(
             view,
@@ -861,6 +1031,16 @@ class MissionDebugViewer(Node):
         self.put_status_row(
             view,
             112,
+            "SCHOOLZONE",
+            schoolzone_status,
+            f"raw=({self.schoolzone_raw_class_id},{self.schoolzone_raw_class_name}) "
+            f"prob={self.schoolzone_raw_prob:.2f} held={self.schoolzone_held:.1f}/{self.args.schoolzone_trust_time:.1f}",
+            schoolzone_color,
+            label_scale=0.42,
+        )
+        self.put_status_row(
+            view,
+            140,
             "GROUP",
             self.group_label(self.current_group),
             f"round={self.round_count}/{self.args.round_total} cone={int(self.cone_started)}/{int(self.cone_finished)}",
@@ -869,13 +1049,23 @@ class MissionDebugViewer(Node):
         )
         self.put_status_row(
             view,
-            140,
+            168,
             "SEGMENT",
             "ON" if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else "off",
             f"shortcut={int(self.shortcut_segment_active)} overtake={int(self.overtake_segment_active)} "
             f"corner={int(self.cornering_segment_active)}",
             (0, 255, 255) if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else (210, 210, 210),
             status_scale=0.48,
+        )
+        self.put_status_row(
+            view,
+            196,
+            "MODEL",
+            self.driver_model_state,
+            self.driver_last_switch[:76],
+            (0, 255, 255),
+            status_scale=0.44,
+            detail_scale=0.34,
         )
         return view
 
@@ -889,7 +1079,7 @@ class MissionDebugViewer(Node):
         scale = max(float(self.args.lidar_scale), 1.0)
         view = cv2.resize(view, (int(view.shape[1] * scale), int(view.shape[0] * scale)))
 
-        panel_h = 150
+        panel_h = 178
         panel = cv2.copyMakeBorder(view, 0, panel_h, 0, 0, cv2.BORDER_CONSTANT, value=(20, 20, 20))
         y0 = view.shape[0] + 24
 
@@ -974,6 +1164,19 @@ class MissionDebugViewer(Node):
             status_scale=0.42,
             detail_scale=0.34,
         )
+        self.put_status_row(
+            panel,
+            y0 + 140,
+            "MODEL",
+            self.driver_model_state,
+            self.driver_last_switch[:48],
+            (0, 255, 255),
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.42,
+            detail_scale=0.32,
+        )
         return panel
 
 
@@ -986,6 +1189,7 @@ def parse_args():
     parser.add_argument("--shortcut-camera-model", default=DEFAULT_SHORTCUT_CAMERA_MODEL_PATH)
     parser.add_argument("--overtake-model", default=DEFAULT_OVERTAKE_MODEL_PATH)
     parser.add_argument("--cornering-model", default=DEFAULT_CORNERING_MODEL_PATH)
+    parser.add_argument("--schoolzone-model", default=DEFAULT_SCHOOLZONE_MODEL_PATH)
     parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="cuda")
     parser.add_argument("--crop", type=parse_crop, default=DEFAULT_CROP)
     parser.add_argument("--traffic-inference-period", type=float, default=0.02)
@@ -993,6 +1197,7 @@ def parse_args():
     parser.add_argument("--shortcut-camera-inference-period", type=float, default=0.02)
     parser.add_argument("--overtake-inference-period", type=float, default=0.02)
     parser.add_argument("--cornering-inference-period", type=float, default=0.02)
+    parser.add_argument("--schoolzone-inference-period", type=float, default=0.02)
     parser.add_argument("--report-period", type=float, default=0.2)
     parser.add_argument("--visible-prob", type=float, default=0.55)
     parser.add_argument("--trust-time", type=float, default=0.6)
@@ -1003,11 +1208,13 @@ def parse_args():
     parser.add_argument("--overtake-trust-time", type=float, default=2.0)
     parser.add_argument("--overtake-clear-time", type=float, default=3.0)
     parser.add_argument("--cornering-prob", type=float, default=0.70)
+    parser.add_argument("--schoolzone-prob", type=float, default=0.70)
+    parser.add_argument("--schoolzone-trust-time", type=float, default=0.4)
     parser.add_argument("--cornering-trust-time", type=float, default=0.6)
     parser.add_argument("--cornering-clear-time", type=float, default=1.0)
     parser.add_argument("--clear-time", type=float, default=0.8)
     parser.add_argument("--cone-seconds", type=float, default=5.0)
-    parser.add_argument("--shortcut-segment-max-time", type=float, default=20.0)
+    parser.add_argument("--shortcut-segment-max-time", type=float, default=0.0)
     parser.add_argument("--group-total", type=int, default=6)
     parser.add_argument("--round-total", type=int, default=3)
     parser.add_argument("--log-all", action="store_true")
