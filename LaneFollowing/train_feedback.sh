@@ -15,7 +15,7 @@ python3 Feedback/train_direction_feedback.py \
   --initial-model-path "$BACKUP" \
   --best-model-path "$BEST" \
   --last-model-path "$LAST" \
-  --feedback-weight 3.0 \
+  --feedback-weight 1.0 \
   --epochs 20 \
   --lr 0.0002 \
   --device cuda \

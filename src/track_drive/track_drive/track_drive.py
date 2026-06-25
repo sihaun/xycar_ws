@@ -10,9 +10,16 @@
 # - 연속 코너링 구간은 전방 카메라 감지 모델로 잡고 전용 주행 모델로 스위칭한다.
 #=============================================
 
+import math
 import time
+from pathlib import Path
 
+import cv2
+import PIL.Image
 import rclpy
+import torch
+import torchvision
+import torchvision.transforms as transforms
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -182,12 +189,18 @@ STEER_RECOVERY_STRAIGHT_RATIO = 0.15  # max_steer의 이 비율 이하이면 직
 STEER_RECOVERY_HARD_TICKS = 3
 STEER_RECOVERY_SLOW_TICKS = 2
 STEER_RECOVERY_SPEED_RATIO = 0.35
+ANGLE_CONTROL_DRIVE_NAMES = ("lane", "shortcut drive", "cornering drive")
+ANGLE_FILTER_EMA_ALPHA = 0.65
+ANGLE_FILTER_SLEW_RATE = 350.0  # steer command units/sec
+ANGLE_CURVE_SPEED_GAIN = 8.0
+SPEED_SLEW_ACCEL_UP = 25.0  # speed command units/sec
+SPEED_SLEW_ACCEL_DOWN = 80.0  # speed command units/sec
 
 SHORTCUT_CAMERA_DETECT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect_cam/best_shortcut_cam_resnet18.pth"
 SHORTCUT_LIDAR_DETECT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect/best_shortcut_resnet18.pth"
 SHORTCUT_DRIVE_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_driving/best_shortcut_driving_direction.pth"
 SHORTCUT_DEVICE = "cuda"
-SHORTCUT_DRIVE_SPEED = 15.0
+SHORTCUT_DRIVE_SPEED = 20.0
 SHORTCUT_STEERING_GAIN = 80.0
 SHORTCUT_STEERING_DGAIN = 20.0
 SHORTCUT_STEERING_BIAS = 0.0
@@ -209,6 +222,7 @@ TRAFFIC_GROUP_TOTAL = 6
 ROUTE_SIGNAL_TOTAL = 3
 ROUND_TOTAL = 3
 ROUTE_SIGNAL_FIRST_BLOCKED_INDEX = 1
+FIRST_SHORTCUT_WAIT_CRAWL_TIME = 0.5
 ROUTE_SIGNAL_COOLDOWN = 2.0
 SIGNAL_CLOCK_MIN_SPEED = 1.0
 
@@ -219,7 +233,7 @@ OVERTAKE_DETECT_INFERENCE_PERIOD = 0.02
 OVERTAKE_DETECT_THRESHOLD = 0.70
 OVERTAKE_DETECT_HOLD_TIME = 2.0
 OVERTAKE_FAST_HOLD_TIME = 0.4
-OVERTAKE_DRIVE_SPEED = 15.0
+OVERTAKE_DRIVE_SPEED = 20.0
 OVERTAKE_STEERING_GAIN = 80.0
 OVERTAKE_STEERING_DGAIN = 20.0
 OVERTAKE_STEERING_BIAS = 0.0
@@ -238,16 +252,124 @@ CORNERING_DETECT_HOLD_TIME = 0.6
 CORNERING_DETECT_GRACE_TIME = 0.5
 CORNERING_MIN_DRIVE_TIME = 1.0
 CORNERING_CLEAR_HOLD_TIME = 3.0
-CORNERING_DRIVE_SPEED = 10.0
+CORNERING_DRIVE_SPEED = 15.0
 CORNERING_STEERING_GAIN = 80.0
 CORNERING_STEERING_DGAIN = 20.0
 CORNERING_STEERING_BIAS = 0.0
 CORNERING_MAX_STEER = 100.0
 CORNERING_INFERENCE_PERIOD = 0.02
-CORNERING_STEER_SPEED_MIN_RATIO = 0.50
+CORNERING_STEER_SPEED_MIN_RATIO = 0.35
 CORNERING_LOG_PERIOD = 0.2
 
+SCHOOLZONE_MODEL_PATH = "/home/xytron/xycar_ws/SchoolZone/schoolzone_detect/best_schoolzone_resnet18.pth"
+SCHOOLZONE_DEVICE = "cuda"
+SCHOOLZONE_INFERENCE_PERIOD = 0.02
+SCHOOLZONE_DETECT_THRESHOLD = 0.70
+SCHOOLZONE_SPEED_LIMIT = 20.0
+SCHOOLZONE_LOG_PERIOD = 0.5
+
 STOP_SPEED = 0.0
+
+
+SCHOOLZONE_CLASS_NONE = 0
+CLASS_SCHOOLZONE = 1
+SCHOOLZONE_CLASS_NAMES = ["none", "schoolzone"]
+
+
+def resolve_schoolzone_device(device, owner):
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"{owner} requested cuda, but torch.cuda.is_available() is False")
+    return torch.device(device)
+
+
+class SchoolZoneCameraDetector:
+
+    def __init__(
+        self,
+        model_path,
+        device="cuda",
+        image_size=224,
+        inference_period=0.02,
+    ):
+        self.model_path = Path(model_path).expanduser()
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"schoolzone camera detect model not found: {self.model_path}")
+
+        self.device = resolve_schoolzone_device(device, "schoolzone camera detector")
+        self.image_size = int(image_size)
+        self.inference_period = float(inference_period)
+        self.mean = torch.Tensor([0.485, 0.456, 0.406]).to(self.device)
+        self.std = torch.Tensor([0.229, 0.224, 0.225]).to(self.device)
+
+        try:
+            self.model = torchvision.models.resnet18(weights=None)
+        except TypeError:
+            self.model = torchvision.models.resnet18(pretrained=False)
+        self.model.fc = torch.nn.Linear(self.model.fc.in_features, len(SCHOOLZONE_CLASS_NAMES))
+        state = torch.load(self.model_path, map_location=self.device)
+        self.model.load_state_dict(state)
+        self.model = self.model.to(self.device).eval()
+
+        self.last_infer_time = 0.0
+        self.last_result = (SCHOOLZONE_CLASS_NONE, 0.0, SCHOOLZONE_CLASS_NAMES[SCHOOLZONE_CLASS_NONE])
+        self.last_debug = {
+            "ready": 0,
+            "model": str(self.model_path),
+            "device": str(self.device),
+        }
+
+    def reset(self):
+        self.last_infer_time = 0.0
+        self.last_result = (SCHOOLZONE_CLASS_NONE, 0.0, SCHOOLZONE_CLASS_NAMES[SCHOOLZONE_CLASS_NONE])
+        self.last_debug = {
+            "ready": 0,
+            "model": str(self.model_path),
+            "device": str(self.device),
+        }
+
+    def preprocess(self, image):
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = PIL.Image.fromarray(rgb)
+        if pil_image.size != (self.image_size, self.image_size):
+            pil_image = pil_image.resize((self.image_size, self.image_size))
+        tensor = transforms.functional.to_tensor(pil_image).to(self.device)
+        tensor.sub_(self.mean[:, None, None]).div_(self.std[:, None, None])
+        return tensor[None, ...]
+
+    def process(self, image, now=None):
+        if image is None:
+            self.last_debug = {"ready": 0, "reason": "no_image"}
+            self.last_result = (SCHOOLZONE_CLASS_NONE, 0.0, SCHOOLZONE_CLASS_NAMES[SCHOOLZONE_CLASS_NONE])
+            return self.last_result
+
+        if now is None:
+            now = time.monotonic()
+        if now - self.last_infer_time < self.inference_period:
+            return self.last_result
+
+        with torch.no_grad():
+            logits = self.model(self.preprocess(image))
+            probs = torch.softmax(logits, dim=1).detach().float().cpu().numpy().flatten()
+
+        class_id = int(probs.argmax())
+        probability = float(probs[class_id])
+        class_name = SCHOOLZONE_CLASS_NAMES[class_id]
+
+        self.last_infer_time = now
+        self.last_result = (class_id, probability, class_name)
+        self.last_debug = {
+            "ready": 1,
+            "class_id": class_id,
+            "class_name": class_name,
+            "prob": probability,
+            "none_prob": float(probs[SCHOOLZONE_CLASS_NONE]),
+            "schoolzone_prob": float(probs[CLASS_SCHOOLZONE]),
+            "model": str(self.model_path),
+            "device": str(self.device),
+        }
+        return self.last_result
 
 
 class TrackDriverNode(Node):
@@ -277,7 +399,7 @@ class TrackDriverNode(Node):
         self.shortcut_left_taken = False
         self.shortcut_force_wait_signal = False
         self.shortcut_red_left_latched = False
-        self.shortcut_counter_compensated = False
+        self.shortcut_straight_green_latched = False
         self.shortcut_cache = []
         self.shortcut_cache_status = {
             "ready": 0,
@@ -314,6 +436,11 @@ class TrackDriverNode(Node):
         self.cornering_raw_class_name = "none"
         self.cornering_raw_prob = 0.0
         self.cornering_confirmed = False
+        self.schoolzone_raw_class_id = 0
+        self.schoolzone_raw_class_name = "none"
+        self.schoolzone_raw_prob = 0.0
+        self.schoolzone_active = False
+        self.schoolzone_last_report_time = 0.0
         self.traffic_raw_class_id = CLASS_NONE
         self.traffic_raw_class_name = "none"
         self.traffic_raw_prob = 0.0
@@ -348,6 +475,7 @@ class TrackDriverNode(Node):
         self.lane_pulse_debug = {}
         self.hard_turn_ticks = 0
         self.straight_recovery_ticks_left = 0
+        self.last_speed_slew_time = self.state_start_time
 
         self.traffic_light_classifier = self.create_traffic_light_classifier()
         self.cone_lane_driver = self.create_lane_driver(
@@ -387,6 +515,7 @@ class TrackDriverNode(Node):
         self.overtake_detector = self.create_overtake_detector()
         self.overtake_camera_driver = self.create_overtake_camera_driver()
         self.cornering_detector = self.create_cornering_detector()
+        self.schoolzone_detector = self.create_schoolzone_detector()
         self.cornering_lane_driver = self.create_lane_driver(
             "cornering drive",
             CORNERING_DRIVE_MODEL_PATH,
@@ -447,6 +576,9 @@ class TrackDriverNode(Node):
             return None
 
         driver.drive_name = name
+        driver.filtered_target_angle = 0.0
+        driver.filtered_angle_time = 0.0
+        driver.filtered_angle_ready = False
         if name == "conedrive":
             driver.steer_speed_min_ratio = CONE_STEER_SPEED_MIN_RATIO
         elif name == "lane":
@@ -559,6 +691,20 @@ class TrackDriverNode(Node):
             return None
 
         self.get_logger().info(f"cornering camera detect model loaded: {detector.model_path} device={detector.device}")
+        return detector
+
+    def create_schoolzone_detector(self):
+        try:
+            detector = SchoolZoneCameraDetector(
+                model_path=SCHOOLZONE_MODEL_PATH,
+                device=SCHOOLZONE_DEVICE,
+                inference_period=SCHOOLZONE_INFERENCE_PERIOD,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"schoolzone camera detect model load failed: {exc}")
+            return None
+
+        self.get_logger().info(f"schoolzone camera detect model loaded: {detector.model_path} device={detector.device}")
         return detector
 
     def create_traffic_light_classifier(self):
@@ -676,6 +822,16 @@ class TrackDriverNode(Node):
             hard_speed_limit = SHORTCUT_CHECK_SPEED
         elif self.state in (STATE_SHORTCUT_CHECK, STATE_SHORTCUT_WAIT_TRAFFIC):
             hard_speed_limit = SHORTCUT_CHECK_SPEED
+        elif (
+            self.state == STATE_SHORTCUT_WAIT_GREEN
+            and self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX
+        ):
+            hard_speed_limit = SHORTCUT_CHECK_SPEED
+        if self.schoolzone_active:
+            if hard_speed_limit is None:
+                hard_speed_limit = SCHOOLZONE_SPEED_LIMIT
+            else:
+                hard_speed_limit = min(abs(float(hard_speed_limit)), SCHOOLZONE_SPEED_LIMIT)
 
         if hard_speed_limit is not None:
             final_speed = max(-hard_speed_limit, min(hard_speed_limit, final_speed))
@@ -701,6 +857,79 @@ class TrackDriverNode(Node):
         self.lane_pulse_debug = {}
         self.hard_turn_ticks = 0
         self.straight_recovery_ticks_left = 0
+
+    def uses_angle_control(self, driver):
+        return getattr(driver, "drive_name", "") in ANGLE_CONTROL_DRIVE_NAMES
+
+    def reset_driver_angle_filter(self, driver):
+        if driver is None:
+            return
+        driver.filtered_target_angle = 0.0
+        driver.filtered_angle_time = 0.0
+        driver.filtered_angle_ready = False
+
+    def filter_target_angle(self, driver, target_angle, now):
+        target_angle = float(target_angle)
+        if not self.uses_angle_control(driver):
+            return target_angle
+
+        max_steer = max(float(getattr(driver, "max_steer", LANE_MAX_STEER)), 1.0)
+        target_angle = max(-max_steer, min(max_steer, target_angle))
+        previous = float(getattr(driver, "filtered_target_angle", target_angle))
+        last_time = float(getattr(driver, "filtered_angle_time", 0.0))
+        ready = bool(getattr(driver, "filtered_angle_ready", False))
+
+        if not ready:
+            filtered = target_angle
+            delta = 0.0
+        else:
+            dt = max(CONTROL_PERIOD, min(now - last_time, 0.2))
+            alpha = max(0.0, min(float(ANGLE_FILTER_EMA_ALPHA), 1.0))
+            ema_angle = previous + (target_angle - previous) * alpha
+            max_delta = max(0.0, float(ANGLE_FILTER_SLEW_RATE)) * dt
+            delta = max(-max_delta, min(max_delta, ema_angle - previous))
+            filtered = previous + delta
+
+        filtered = max(-max_steer, min(max_steer, filtered))
+        driver.filtered_target_angle = filtered
+        driver.filtered_angle_time = now
+        driver.filtered_angle_ready = True
+
+        self.lane_pulse_debug.update({
+            "raw_target_angle": target_angle,
+            "filtered_target_angle": filtered,
+            "angle_filter_delta": filtered - previous,
+        })
+
+        debug = getattr(driver, "last_debug", None)
+        if isinstance(debug, dict):
+            debug["filtered_steer"] = filtered
+            debug["steer_filter_delta"] = delta
+            debug["steer"] = filtered
+
+        return filtered
+
+    def limit_speed_delta(self, driver, target_speed, now):
+        speed = float(target_speed)
+        if not self.uses_angle_control(driver):
+            return speed
+
+        previous = float(self.last_drive_output_speed)
+        dt = max(CONTROL_PERIOD, min(now - self.last_speed_slew_time, 0.1))
+        self.last_speed_slew_time = now
+        delta = speed - previous
+        if delta >= 0.0:
+            max_delta = max(0.0, float(SPEED_SLEW_ACCEL_UP)) * dt
+        else:
+            max_delta = max(0.0, float(SPEED_SLEW_ACCEL_DOWN)) * dt
+        limited = previous + max(-max_delta, min(max_delta, delta))
+
+        self.lane_pulse_debug.update({
+            "speed_slew_target": speed,
+            "speed_slew_output": limited,
+            "speed_slew_active": int(abs(limited - speed) > 1e-6),
+        })
+        return limited
 
     def reset_overtake_detection(self):
         self.overtake_candidate_start_time = None
@@ -800,6 +1029,8 @@ class TrackDriverNode(Node):
             STATE_SHORTCUT_WAIT_SIGNAL,
         ):
             return False
+        if self.state == STATE_SHORTCUT_WAIT_GREEN and not self.green_visible:
+            return False
 
         if self.update_overtake_detection(
             now,
@@ -891,6 +1122,7 @@ class TrackDriverNode(Node):
         self.get_logger().info(f"MODEL SWITCH OVERTAKE_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
+            self.reset_driver_angle_filter(self.lane_driver)
         self.reset_lane_pulse()
         self.stop_overtake_monitor(reason)
         self.set_state(STATE_LANE)
@@ -950,6 +1182,34 @@ class TrackDriverNode(Node):
 
         return self.cornering_confirmed
 
+    def update_schoolzone_detection(self, now):
+        if self.schoolzone_detector is None or self.front_image is None:
+            self.schoolzone_raw_class_id = 0
+            self.schoolzone_raw_class_name = "none"
+            self.schoolzone_raw_prob = 0.0
+            self.schoolzone_active = False
+            return False
+
+        class_id, probability, class_name = self.schoolzone_detector.process(self.front_image, now)
+        was_active = self.schoolzone_active
+        self.schoolzone_raw_class_id = class_id
+        self.schoolzone_raw_class_name = class_name
+        self.schoolzone_raw_prob = probability
+        self.schoolzone_active = (
+            class_id == CLASS_SCHOOLZONE
+            and probability >= SCHOOLZONE_DETECT_THRESHOLD
+        )
+
+        if self.schoolzone_active != was_active or now - self.schoolzone_last_report_time >= SCHOOLZONE_LOG_PERIOD:
+            self.schoolzone_last_report_time = now
+            self.get_logger().info(
+                f"SCHOOLZONE detect active={int(self.schoolzone_active)} "
+                f"det=({class_id},{class_name},{probability:.2f}) "
+                f"speed_limit={SCHOOLZONE_SPEED_LIMIT:.1f}"
+            )
+
+        return self.schoolzone_active
+
     def start_corner_drive(self, now):
         if self.state != STATE_LANE or self.overtake_monitor_enabled:
             self.reset_cornering_detection()
@@ -961,6 +1221,7 @@ class TrackDriverNode(Node):
             return False
 
         self.cornering_lane_driver.reset()
+        self.reset_driver_angle_filter(self.cornering_lane_driver)
         self.reset_lane_pulse()
         self.cornering_no_start_time = None
         self.last_log_time = now
@@ -1015,6 +1276,7 @@ class TrackDriverNode(Node):
         self.get_logger().info(f"MODEL SWITCH CORNER_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
+            self.reset_driver_angle_filter(self.lane_driver)
         self.reset_lane_pulse()
         self.reset_cornering_detection()
         if self.cornering_detector is not None:
@@ -1048,10 +1310,18 @@ class TrackDriverNode(Node):
             key: self.lane_pulse_debug[key]
             for key in (
                 "target_angle",
+                "raw_target_angle",
+                "filtered_target_angle",
+                "angle_filter_delta",
                 "straight_speed",
                 "speed_ratio",
+                "speed_curve_mode",
+                "speed_curve",
                 "scaled_speed",
                 "speed_limit",
+                "speed_slew_target",
+                "speed_slew_output",
+                "speed_slew_active",
                 "hard_turn_ticks",
                 "recovery_ticks_left",
                 "recovery_active",
@@ -1068,13 +1338,21 @@ class TrackDriverNode(Node):
         return angle, speed
 
     def speed_for_steer(self, driver, target_angle, straight_speed):
-        # 조향 요구량이 커질수록 직선 최대속도에서 선형으로 감속한다.
+        # LANE/SHORTCUT/CORNER는 조향각을 곡률 프록시로 보고 더 민감하게 감속한다.
         max_steer = max(float(getattr(driver, "max_steer", LANE_MAX_STEER)), 1.0)
         abs_target_angle = abs(float(target_angle))
         steer_ratio = min(abs_target_angle / max_steer, 1.0)
         driver_min_ratio = getattr(driver, "steer_speed_min_ratio", STEER_SPEED_MIN_RATIO)
         min_ratio = max(0.0, min(float(driver_min_ratio), 1.0))
-        speed_ratio = 1.0 - (1.0 - min_ratio) * steer_ratio
+        if self.uses_angle_control(driver):
+            curve = math.sin(steer_ratio * math.pi * 0.5)
+            speed_ratio = 1.0 / math.sqrt(1.0 + max(0.0, float(ANGLE_CURVE_SPEED_GAIN)) * curve)
+            speed_ratio = max(min_ratio, min(1.0, speed_ratio))
+            speed_curve_mode = "curvature"
+        else:
+            curve = steer_ratio
+            speed_ratio = 1.0 - (1.0 - min_ratio) * steer_ratio
+            speed_curve_mode = "linear"
         hard_threshold = max_steer * max(0.0, min(float(STEER_RECOVERY_HARD_RATIO), 1.0))
         straight_threshold = max_steer * max(0.0, min(float(STEER_RECOVERY_STRAIGHT_RATIO), 1.0))
         recovery_active = False
@@ -1104,6 +1382,8 @@ class TrackDriverNode(Node):
             "target_angle": float(target_angle),
             "straight_speed": float(straight_speed),
             "speed_ratio": speed_ratio,
+            "speed_curve_mode": speed_curve_mode,
+            "speed_curve": curve,
             "scaled_speed": scaled_speed,
             "hard_turn_ticks": self.hard_turn_ticks,
             "recovery_ticks_left": self.straight_recovery_ticks_left,
@@ -1166,9 +1446,28 @@ class TrackDriverNode(Node):
     def should_limit_active_shortcut_speed(self):
         if not self.is_active_shortcut_signal():
             return False
+        if self.shortcut_left_taken:
+            return False
         if self.traffic_group_armed:
             return False
         return self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX
+
+    def should_stop_for_active_shortcut_non_green(self):
+        if not self.is_active_shortcut_signal():
+            return False
+        if self.shortcut_straight_green_latched:
+            return False
+        if self.green_visible:
+            return False
+        if not (self.traffic_visible or self.traffic_raw_visible):
+            return False
+        return True
+
+    def should_crawl_first_shortcut_wait_green(self, now):
+        if self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
+            return False
+        start_time = self.shortcut_wait_signal_start_time or self.state_start_time
+        return now - start_time < FIRST_SHORTCUT_WAIT_CRAWL_TIME
 
     def current_shortcut_signal_index(self):
         if self.pending_shortcut_route_signal > 0:
@@ -1666,6 +1965,7 @@ class TrackDriverNode(Node):
                 f"traffic group {group}/{TRAFFIC_GROUP_TOTAL} passed, round={self.round_count}/{ROUND_TOTAL}"
             )
         self.active_traffic_group = 0
+        self.shortcut_straight_green_latched = False
 
     def start_cone(self, now):
         if self.cone_lane_driver is None:
@@ -1692,6 +1992,7 @@ class TrackDriverNode(Node):
             return
 
         self.lane_driver.reset()
+        self.reset_driver_angle_filter(self.lane_driver)
         self.reset_lane_pulse()
         self.lane_start_time = now
         self.signal_clock = 0.0
@@ -1711,7 +2012,7 @@ class TrackDriverNode(Node):
         self.shortcut_force_wait_signal = False
         self.shortcut_red_left_latched = False
         self.shortcut_wait_signal_start_time = None
-        self.shortcut_counter_compensated = False
+        self.shortcut_straight_green_latched = False
         self.stop_overtake_monitor("lane start reset")
         self.overtake_done_in_segment = False
         self.reset_cornering_detection()
@@ -1752,6 +2053,7 @@ class TrackDriverNode(Node):
 
     def start_shortcut_wait_green(self, now, reason, enable_overtake_after_green=True):
         self.shortcut_wait_signal_start_time = now
+        self.shortcut_straight_green_latched = False
         self.overtake_pending_after_green = bool(enable_overtake_after_green)
         self.last_log_time = now
         self.reset_lane_pulse()
@@ -1793,35 +2095,6 @@ class TrackDriverNode(Node):
             return
         self.start_shortcut_wait_traffic(now, reason)
 
-    def compensate_shortcut_entry_counters(self, now):
-        if self.shortcut_counter_compensated:
-            return
-        if self.route_signal_count <= 0:
-            return
-
-        old_group = self.traffic_group_count
-        old_round = self.round_count
-        target_group = min(max(self.traffic_group_count, self.route_signal_count * 2), TRAFFIC_GROUP_TOTAL)
-        target_round = min(max(self.round_count, self.route_signal_count), ROUND_TOTAL)
-
-        if target_group == old_group and target_round == old_round:
-            self.shortcut_counter_compensated = True
-            return
-
-        self.traffic_group_count = target_group
-        self.round_count = target_round
-        self.active_traffic_group = 0
-        self.traffic_group_armed = True
-        self.traffic_group_last_clock = self.signal_clock
-        self.traffic_last_visible_time = 0.0
-        self.shortcut_counter_compensated = True
-        self.get_logger().info(
-            f"SHORTCUT COUNTER COMPENSATION on model switch: "
-            f"group={old_group}->{self.traffic_group_count}/{TRAFFIC_GROUP_TOTAL} "
-            f"round={old_round}->{self.round_count}/{ROUND_TOTAL} "
-            f"route={self.route_signal_count}/{ROUTE_SIGNAL_TOTAL}"
-        )
-
     def start_shortcut_drive(self, now):
         self.stop_overtake_monitor("shortcut drive selected")
         if self.shortcut_lane_driver is None:
@@ -1839,9 +2112,9 @@ class TrackDriverNode(Node):
             return
 
         self.shortcut_lane_driver.reset()
+        self.reset_driver_angle_filter(self.shortcut_lane_driver)
         self.reset_lane_pulse()
         self.shortcut_left_taken = True
-        self.compensate_shortcut_entry_counters(now)
         self.last_log_time = now
         self.get_logger().info("SHORTCUT_DETECT -> SHORTCUT_DRIVE model ON")
         self.set_state(STATE_SHORTCUT_DRIVE)
@@ -1865,6 +2138,7 @@ class TrackDriverNode(Node):
 
         target_angle, speed = driver.process(self.front_image, now)
         target_angle = self.apply_drive_angle_offset(driver, target_angle)
+        target_angle = self.filter_target_angle(driver, target_angle, now)
         drive_name = getattr(driver, "drive_name", "")
         if drive_name == "overtake drive":
             # 추월 모델은 신호등/지름길 대기나 공통 조향 감속 정책과 완전히 분리한다.
@@ -1893,6 +2167,7 @@ class TrackDriverNode(Node):
                 speed = min(speed, speed_limit)
                 self.lane_pulse_debug["speed_limit"] = float(speed_limit)
 
+        speed = self.limit_speed_delta(driver, speed, now)
         angle, speed = self.pulse_lane_command(driver, target_angle, speed)
         self.drive(angle, speed)
 
@@ -1938,14 +2213,10 @@ class TrackDriverNode(Node):
 
         if self.shortcut_left_taken:
             self.get_logger().info(
-                f"SHORTCUT_DETECT skipped: shortcut was already taken; source={source}"
+                f"SHORTCUT_DETECT skipped: shortcut was already taken; "
+                f"source={source}; keep normal lane speed"
             )
-            self.start_shortcut_wait_green(
-                now,
-                "shortcut already used",
-                enable_overtake_after_green=False,
-            )
-            return True
+            return False
 
         last_chance = (
             SHORTCUT_LAST_CHANCE_FORCE_OPEN
@@ -1977,21 +2248,6 @@ class TrackDriverNode(Node):
         return False
 
     def run_lane(self, now):
-        if self.overtake_monitor_enabled:
-            signal_kind = self.update_traffic_group(now, allow_shortcut=False)
-            if signal_kind == "middle":
-                self.stop_overtake_monitor("middle signal reached")
-                self.run_model_drive(self.lane_driver, now)
-                return
-
-            if self.update_overtake_monitor(now):
-                if self.start_overtake_drive(now):
-                    self.run_overtake_drive(now)
-                    return
-
-            self.run_model_drive(self.lane_driver, now)
-            return
-
         shortcut_cache = self.update_shortcut_cache(now)
         self.confirm_pending_shortcut_group_if_ready(now)
         signal_kind = self.update_traffic_group(now)
@@ -2017,6 +2273,25 @@ class TrackDriverNode(Node):
                 self.stop_overtake_monitor("shortcut claimed by camera")
                 if self.handle_shortcut_signal_decision(now, shortcut_cache, "camera"):
                     return
+
+        if self.is_active_shortcut_signal() and self.green_visible:
+            self.shortcut_straight_green_latched = True
+
+        # 지름길 판단 신호등에서 직진 루트로 갈 때도 초록불 전에는 절대 진행하지 않는다.
+        if self.should_stop_for_active_shortcut_non_green():
+            if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
+                self.shortcut_check_last_report_time = now
+                self.get_logger().info(
+                    f"SHORTCUT_STRAIGHT_WAIT stop until green "
+                    f"group={self.active_traffic_group}/{TRAFFIC_GROUP_TOTAL} "
+                    f"shortcut_signal={self.current_shortcut_signal_index()}/{ROUTE_SIGNAL_TOTAL} "
+                    f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f}) "
+                    f"raw_tl=({self.traffic_raw_class_id},{self.traffic_raw_class_name},"
+                    f"{self.traffic_raw_prob:.2f})"
+                )
+            self.reset_lane_pulse()
+            self.drive(0.0, STOP_SPEED)
+            return
 
         # 중간 신호등이나 예상 밖 일반 빨간불은 신호위반 방지를 위해 정지한다.
         if self.red_visible and not self.is_active_shortcut_signal():
@@ -2108,11 +2383,15 @@ class TrackDriverNode(Node):
                 else:
                     self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
             else:
-                self.reset_lane_pulse()
-                self.drive(0.0, STOP_SPEED)
+                if self.should_crawl_first_shortcut_wait_green(now):
+                    self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+                else:
+                    self.reset_lane_pulse()
+                    self.drive(0.0, STOP_SPEED)
             return
 
         if self.green_visible:
+            self.shortcut_straight_green_latched = True
             self.get_logger().info(
                 f"green straight signal detected -> normal lane drive "
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f})"
@@ -2138,8 +2417,11 @@ class TrackDriverNode(Node):
                 f"tl=({self.traffic_class_id},{self.traffic_class_name},{self.traffic_prob:.2f})"
             )
 
-        self.reset_lane_pulse()
-        self.drive(0.0, STOP_SPEED)
+        if self.should_crawl_first_shortcut_wait_green(now):
+            self.run_model_drive(self.lane_driver, now, speed_limit=SHORTCUT_CHECK_SPEED)
+        else:
+            self.reset_lane_pulse()
+            self.drive(0.0, STOP_SPEED)
 
     def run_shortcut_wait_traffic(self, now):
         self.confirm_pending_shortcut_group_if_ready(now)
@@ -2209,6 +2491,7 @@ class TrackDriverNode(Node):
             self.shortcut_done = self.route_signal_count >= ROUTE_SIGNAL_TOTAL
             self.get_logger().info("shortcut drive timeout -> normal lane model")
             self.lane_driver.reset()
+            self.reset_driver_angle_filter(self.lane_driver)
             self.reset_lane_pulse()
             self.lane_start_time = now
             self.active_traffic_group = 0
@@ -2249,6 +2532,7 @@ class TrackDriverNode(Node):
     def control_loop(self):
         now = time.monotonic()
         self.update_signal_clock(now)
+        self.update_schoolzone_detection(now)
         green = self.green_visible
 
         if self.state == STATE_WAIT_GREEN:
@@ -2376,6 +2660,9 @@ class TrackDriverNode(Node):
             f"{self.cornering_raw_prob:.2f},{cornering_hold:.2f}/"
             f"{CORNERING_DETECT_HOLD_TIME:.2f},{int(self.cornering_confirmed)},"
             f"no={cornering_no_hold:.2f}/{CORNERING_CLEAR_HOLD_TIME:.2f}) "
+            f"schoolzone=({int(self.schoolzone_active)},"
+            f"{self.schoolzone_raw_class_id},{self.schoolzone_raw_class_name},"
+            f"{self.schoolzone_raw_prob:.2f},limit={SCHOOLZONE_SPEED_LIMIT:.1f}) "
             f"pulse=({pulse_angle:.1f},{pulse_ticks}) "
             f"cmd=({self.motor_msg.angle:.0f},{self.motor_msg.speed:.0f})"
         )
