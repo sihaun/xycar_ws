@@ -38,6 +38,7 @@ DEFAULT_CORNERING_MODEL_PATH = "/home/xytron/xycar_ws/Cornering/corner_detect/be
 DEFAULT_CAMERA_TOPIC = "/usb_cam/image_raw/front"
 DEFAULT_SCAN_TOPIC = "/scan"
 DEFAULT_CROP = (160, 20, 360, 170)
+DEBUG_WINDOW_NAME = "Mission Debug"
 
 CLASS_GREEN = 3
 CLASS_RED_LEFT = 4
@@ -112,6 +113,15 @@ class MissionDebugViewer(Node):
         self.cornering_clear_start_time = None
         self.cornering_segment_active = False
         self.cornering_segment_start_time = None
+        self.latest_traffic_view = self.make_traffic_view(
+            np.zeros((120, 220, 3), dtype=np.uint8),
+            0,
+            "waiting",
+            0.0,
+            [],
+        )
+        self.latest_front_view = self.make_front_camera_view(np.zeros((480, 640, 3), dtype=np.uint8))
+        self.latest_lidar_view = self.make_lidar_view(None)
 
         self.classifier = TrafficLightClassifier(
             model_path=args.traffic_model,
@@ -147,16 +157,8 @@ class MissionDebugViewer(Node):
             self.get_logger().warning("DISPLAY is not set; OpenCV windows disabled, CLI logs only")
         if self.show_enabled:
             try:
-                cv2.namedWindow("TrafficLight Crop", cv2.WINDOW_NORMAL)
-                cv2.imshow(
-                    "TrafficLight Crop",
-                    self.make_traffic_view(np.zeros((120, 220, 3), dtype=np.uint8), 0, "waiting", 0.0, []),
-                )
-                cv2.namedWindow("Front Camera", cv2.WINDOW_NORMAL)
-                cv2.imshow("Front Camera", self.make_front_camera_view(np.zeros((480, 640, 3), dtype=np.uint8)))
-                cv2.namedWindow("Mission Lidar BEV", cv2.WINDOW_NORMAL)
-                cv2.imshow("Mission Lidar BEV", self.make_lidar_view(None))
-                cv2.waitKey(1)
+                cv2.namedWindow(DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
+                self.show_debug_window()
             except cv2.error as exc:
                 self.show_enabled = False
                 self.get_logger().error(f"OpenCV window failed: {exc}; CLI logs only")
@@ -182,7 +184,7 @@ class MissionDebugViewer(Node):
         probs = debug.get("probs", [])
 
         if self.show_enabled:
-            cv2.imshow("TrafficLight Crop", self.make_traffic_view(crop, class_id, class_name, probability, probs))
+            self.latest_traffic_view = self.make_traffic_view(crop, class_id, class_name, probability, probs)
 
         self.update_traffic_event_log(class_id, probability, class_name, probs, now)
 
@@ -237,10 +239,8 @@ class MissionDebugViewer(Node):
                 )
 
         if self.show_enabled:
-            cv2.imshow("Front Camera", self.make_front_camera_view(image))
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                self.should_exit = True
+            self.latest_front_view = self.make_front_camera_view(image)
+            self.show_debug_window()
 
     def scan_callback(self, msg):
         now = time.monotonic()
@@ -268,7 +268,8 @@ class MissionDebugViewer(Node):
                 )
 
         if self.show_enabled:
-            cv2.imshow("Mission Lidar BEV", self.make_lidar_view(ranges))
+            self.latest_lidar_view = self.make_lidar_view(ranges)
+            self.show_debug_window()
 
     def timer_callback(self):
         now = time.monotonic()
@@ -458,6 +459,7 @@ class MissionDebugViewer(Node):
         if visible:
             if self.candidate_start_time is None:
                 self.candidate_start_time = now
+            self.maybe_log_early_shortcut_zone(class_id, probability, class_name, now)
             trusted = now - self.candidate_start_time >= self.args.trust_time
             if not trusted and not self.traffic_visible:
                 return
@@ -480,6 +482,23 @@ class MissionDebugViewer(Node):
         self.candidate_start_time = None
         if self.traffic_visible and now - self.last_visible_time >= self.args.clear_time:
             self.finish_visible_signal(now)
+
+    def maybe_log_early_shortcut_zone(self, class_id, probability, class_name, now):
+        if self.traffic_visible:
+            return
+        next_group = max(0, self.signal_count)
+        if not self.is_shortcut_group(next_group):
+            return
+        if self.last_shortcut_zone_group == next_group:
+            return
+
+        self.last_shortcut_zone_group = next_group
+        elapsed = now - (self.candidate_start_time or now)
+        self.get_logger().info(
+            f"SHORTCUT DECISION ZONE ENTER group={self.group_label(next_group)} "
+            f"round={self.round_count}/{self.args.round_total} mode=early "
+            f"raw_signal=({class_id},{class_name},{probability:.2f}) seen={elapsed:.2f}s"
+        )
 
     def is_visible_signal(self, class_id, probability):
         return class_id != CLASS_NONE and probability >= self.args.visible_prob
@@ -645,6 +664,46 @@ class MissionDebugViewer(Node):
         if 0 <= class_id < len(TRAFFIC_CLASS_NAMES):
             return TRAFFIC_CLASS_NAMES[class_id]
         return "unknown"
+
+    def resize_to_width(self, image, width):
+        if image is None or image.size == 0:
+            image = np.zeros((120, max(int(width), 1), 3), dtype=np.uint8)
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        target_width = max(int(width), 1)
+        height, current_width = image.shape[:2]
+        if current_width == target_width:
+            return image
+
+        scale = float(target_width) / max(current_width, 1)
+        target_height = max(int(height * scale), 1)
+        return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+    def make_combined_view(self):
+        gap = 8
+        side_width = max(int(self.args.side_width), 320)
+        front = self.latest_front_view
+        traffic = self.resize_to_width(self.latest_traffic_view, side_width)
+        lidar = self.resize_to_width(self.latest_lidar_view, side_width)
+
+        right_height = traffic.shape[0] + gap + lidar.shape[0]
+        canvas_height = max(front.shape[0], right_height)
+        canvas_width = front.shape[1] + gap + side_width
+        canvas = np.full((canvas_height, canvas_width, 3), 18, dtype=np.uint8)
+
+        canvas[0:front.shape[0], 0:front.shape[1]] = front
+        right_x = front.shape[1] + gap
+        canvas[0:traffic.shape[0], right_x:right_x + side_width] = traffic
+        lidar_y = traffic.shape[0] + gap
+        canvas[lidar_y:lidar_y + lidar.shape[0], right_x:right_x + side_width] = lidar
+        return canvas
+
+    def show_debug_window(self):
+        cv2.imshow(DEBUG_WINDOW_NAME, self.make_combined_view())
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            self.should_exit = True
 
     def make_traffic_view(self, crop, class_id, class_name, probability, probs):
         if crop.size == 0:
@@ -955,6 +1014,7 @@ def parse_args():
     parser.add_argument("--scale", type=float, default=2.5)
     parser.add_argument("--front-width", type=int, default=640)
     parser.add_argument("--lidar-scale", type=float, default=2.0)
+    parser.add_argument("--side-width", type=int, default=460)
     return parser.parse_args()
 
 
