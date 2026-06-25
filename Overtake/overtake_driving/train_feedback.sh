@@ -12,7 +12,7 @@ fi
 python3 Feedback/train_direction_feedback.py \
   --base-dataset-dir Overtake/overtake_driving/dataset_xy \
   --feedback-dataset-dir Overtake/overtake_driving/feedback_dataset_xy \
-  --initial-model-path "$BEST" \
+  --initial-model-path "$BACKUP" \
   --best-model-path "$BEST" \
   --last-model-path "$LAST" \
   --feedback-weight 3.0 \

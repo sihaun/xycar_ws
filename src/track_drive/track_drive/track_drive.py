@@ -7,6 +7,7 @@
 # - 라바콘 이후 신호등 그룹 패턴을 세며 지름길 판단 신호등에서 카메라+라이다 퓨전 판단을 켠다.
 # - 지름길이 열려 있으면 정지한 뒤 빨강+좌회전 신호에서 지름길 전용 모델로 스위칭한다.
 # - 추월는 전방 카메라로 상황을 감지하고 전방 카메라 모델로 추월 주행한다.
+# - 연속 코너링 구간은 전방 카메라 감지 모델로 잡고 전용 주행 모델로 스위칭한다.
 #=============================================
 
 import time
@@ -71,6 +72,21 @@ except Exception as exc:
     OvertakeCameraDriver = None
     OVERTAKE_IMPORT_ERROR = exc
 
+CORNERING_IMPORT_ERROR = None
+try:
+    from track_drive.corner_drive import CLASS_CORNERING, CorneringCameraDetector
+except ImportError:
+    try:
+        from corner_drive import CLASS_CORNERING, CorneringCameraDetector
+    except Exception as exc:
+        CLASS_CORNERING = 1
+        CorneringCameraDetector = None
+        CORNERING_IMPORT_ERROR = exc
+except Exception as exc:
+    CLASS_CORNERING = 1
+    CorneringCameraDetector = None
+    CORNERING_IMPORT_ERROR = exc
+
 TRAFFIC_LIGHT_IMPORT_ERROR = None
 try:
     from track_drive.traffic_light_model import (
@@ -120,6 +136,7 @@ STATE_SHORTCUT_WAIT_GREEN = "SHORTCUT_WAIT_GREEN"
 STATE_SHORTCUT_WAIT_SIGNAL = "SHORTCUT_WAIT_SIGNAL"
 STATE_SHORTCUT_DRIVE = "SHORTCUT_DRIVE"
 STATE_OVERTAKE_DRIVE = "OVERTAKE_DRIVE"
+STATE_CORNER_DRIVE = "CORNER_DRIVE"
 STATE_STOP = "STOP"
 
 TRAFFIC_LIGHT_MODEL_PATH = "/home/xytron/xycar_ws/TrafficLight/best_traffic_light_resnet18.pth"
@@ -147,7 +164,7 @@ CONE_MODEL_SECONDS = 5.0
 CONE_STEER_SPEED_MIN_RATIO = 0.35
 CONE_STEER_SCALE = 1.0
 
-LANE_MODEL_PATH = "/home/xytron/xycar_ws/LaneFollowing/best_model_direction.pth"
+LANE_MODEL_PATH = "/home/xytron/xycar_ws/LaneFollowing/best_model_direction.before_feedback.pth"
 LANE_DEVICE = "cuda"
 LANE_SPEED = 20.0
 LANE_STEERING_GAIN = 80.0
@@ -158,7 +175,8 @@ LANE_INFERENCE_PERIOD = 0.02
 LANE_PULSE_DEADBAND = 5.0
 LANE_PULSE_TICKS = 2
 LANE_PULSE_SCALE = 1.0
-STEER_SPEED_MIN_RATIO = 0.35  # 모든 주행 speed 값은 직선 최대속도, 최대 조향에서는 이 비율까지 선형 감속한다.
+LANE_STEER_SPEED_MIN_RATIO = 0.20
+STEER_SPEED_MIN_RATIO = 0.35  # 별도 지정이 없는 주행은 최대 조향에서 이 비율까지 선형 감속한다.
 STEER_RECOVERY_HARD_RATIO = 0.45  # max_steer의 이 비율 이상이면 큰 조향으로 본다.
 STEER_RECOVERY_STRAIGHT_RATIO = 0.15  # max_steer의 이 비율 이하이면 직진에 가까운 조향으로 본다.
 STEER_RECOVERY_HARD_TICKS = 3
@@ -208,6 +226,22 @@ OVERTAKE_MAX_STEER = 100.0
 OVERTAKE_INFERENCE_PERIOD = 0.02
 OVERTAKE_FORCE_AFTER_LAST_YES_TIME = 3.0
 OVERTAKE_LOG_PERIOD = 0.2
+
+CORNERING_DETECT_MODEL_PATH = "/home/xytron/xycar_ws/Cornering/corner_detect/best_corner_detect_resnet18.pth"
+CORNERING_DRIVE_MODEL_PATH = "/home/xytron/xycar_ws/Cornering/corner_driving/best_corner_driving_direction.pth"
+CORNERING_DEVICE = "cuda"
+CORNERING_DETECT_INFERENCE_PERIOD = 0.02
+CORNERING_DETECT_THRESHOLD = 0.70
+CORNERING_DETECT_HOLD_TIME = 0.6
+CORNERING_CLEAR_HOLD_TIME = 1.0
+CORNERING_DRIVE_SPEED = 12.0
+CORNERING_STEERING_GAIN = 80.0
+CORNERING_STEERING_DGAIN = 20.0
+CORNERING_STEERING_BIAS = 0.0
+CORNERING_MAX_STEER = 100.0
+CORNERING_INFERENCE_PERIOD = 0.02
+CORNERING_STEER_SPEED_MIN_RATIO = 0.20
+CORNERING_LOG_PERIOD = 0.2
 
 STOP_SPEED = 0.0
 
@@ -263,6 +297,13 @@ class TrackDriverNode(Node):
         self.overtake_raw_class_name = "none"
         self.overtake_raw_prob = 0.0
         self.overtake_confirmed = False
+        self.cornering_candidate_start_time = None
+        self.cornering_no_start_time = None
+        self.cornering_last_report_time = 0.0
+        self.cornering_raw_class_id = 0
+        self.cornering_raw_class_name = "none"
+        self.cornering_raw_prob = 0.0
+        self.cornering_confirmed = False
         self.traffic_raw_class_id = CLASS_NONE
         self.traffic_raw_class_name = "none"
         self.traffic_raw_prob = 0.0
@@ -333,6 +374,18 @@ class TrackDriverNode(Node):
         self.shortcut_lidar_detector = self.create_shortcut_lidar_detector()
         self.overtake_detector = self.create_overtake_detector()
         self.overtake_camera_driver = self.create_overtake_camera_driver()
+        self.cornering_detector = self.create_cornering_detector()
+        self.cornering_lane_driver = self.create_lane_driver(
+            "cornering drive",
+            CORNERING_DRIVE_MODEL_PATH,
+            CORNERING_DRIVE_SPEED,
+            CORNERING_STEERING_GAIN,
+            CORNERING_STEERING_DGAIN,
+            CORNERING_STEERING_BIAS,
+            CORNERING_MAX_STEER,
+            CORNERING_INFERENCE_PERIOD,
+            device=CORNERING_DEVICE,
+        )
 
         self.motor_pub = self.create_publisher(XycarMotor, "xycar_motor", 10)
         self.create_subscription(
@@ -348,7 +401,7 @@ class TrackDriverNode(Node):
             qos_profile_sensor_data,
         )
         self.create_timer(CONTROL_PERIOD, self.control_loop)
-        self.get_logger().info("----- track_drive traffic/cone/lane/shortcut/overtake models started -----")
+        self.get_logger().info("----- track_drive traffic/cone/lane/shortcut/overtake/cornering models started -----")
 
     def create_lane_driver(
         self,
@@ -384,6 +437,10 @@ class TrackDriverNode(Node):
         driver.drive_name = name
         if name == "conedrive":
             driver.steer_speed_min_ratio = CONE_STEER_SPEED_MIN_RATIO
+        elif name == "lane":
+            driver.steer_speed_min_ratio = LANE_STEER_SPEED_MIN_RATIO
+        elif name == "cornering drive":
+            driver.steer_speed_min_ratio = CORNERING_STEER_SPEED_MIN_RATIO
         else:
             driver.steer_speed_min_ratio = STEER_SPEED_MIN_RATIO
 
@@ -471,6 +528,24 @@ class TrackDriverNode(Node):
 
         self.get_logger().info(f"overtake camera driving model loaded: {driver.model_path} device={driver.device}")
         return driver
+
+    def create_cornering_detector(self):
+        if CorneringCameraDetector is None:
+            self.get_logger().error(f"cornering detector import failed: {CORNERING_IMPORT_ERROR}")
+            return None
+
+        try:
+            detector = CorneringCameraDetector(
+                model_path=CORNERING_DETECT_MODEL_PATH,
+                device=CORNERING_DEVICE,
+                inference_period=CORNERING_DETECT_INFERENCE_PERIOD,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"cornering camera detect model load failed: {exc}")
+            return None
+
+        self.get_logger().info(f"cornering camera detect model loaded: {detector.model_path} device={detector.device}")
+        return detector
 
     def create_traffic_light_classifier(self):
         if TrafficLightClassifier is None:
@@ -594,6 +669,14 @@ class TrackDriverNode(Node):
         self.overtake_raw_prob = 0.0
         self.overtake_confirmed = False
 
+    def reset_cornering_detection(self):
+        self.cornering_candidate_start_time = None
+        self.cornering_no_start_time = None
+        self.cornering_raw_class_id = 0
+        self.cornering_raw_class_name = "none"
+        self.cornering_raw_prob = 0.0
+        self.cornering_confirmed = False
+
     def start_overtake_monitor(self, now, reason):
         if self.overtake_detector is None:
             self.get_logger().warning(f"OVERTAKE_DETECT skipped: detector is not ready ({reason})")
@@ -701,6 +784,9 @@ class TrackDriverNode(Node):
 
         self.overtake_camera_driver.reset()
         self.reset_lane_pulse()
+        self.reset_cornering_detection()
+        if self.cornering_detector is not None:
+            self.cornering_detector.reset()
         self.overtake_monitor_enabled = False
         self.overtake_done_in_segment = True
         self.overtake_no_start_time = None
@@ -723,6 +809,104 @@ class TrackDriverNode(Node):
             self.lane_driver.reset()
         self.reset_lane_pulse()
         self.stop_overtake_monitor(reason)
+        self.set_state(STATE_LANE)
+
+    def update_cornering_monitor(self, now):
+        # 일반 LANE 주행 중에만 연속 코너링 구간을 감지한다.
+        if self.state != STATE_LANE or self.overtake_monitor_enabled:
+            self.reset_cornering_detection()
+            return False
+
+        if self.cornering_detector is None or self.front_image is None:
+            self.reset_cornering_detection()
+            return False
+
+        class_id, probability, class_name = self.cornering_detector.process(self.front_image, now)
+        self.cornering_raw_class_id = class_id
+        self.cornering_raw_class_name = class_name
+        self.cornering_raw_prob = probability
+
+        is_yes = class_id == CLASS_CORNERING and probability >= CORNERING_DETECT_THRESHOLD
+        if is_yes:
+            if self.cornering_candidate_start_time is None:
+                self.cornering_candidate_start_time = now
+            held = now - self.cornering_candidate_start_time
+            self.cornering_no_start_time = None
+        else:
+            self.cornering_candidate_start_time = None
+            held = 0.0
+
+        self.cornering_confirmed = is_yes and held >= CORNERING_DETECT_HOLD_TIME
+
+        if now - self.cornering_last_report_time >= CORNERING_LOG_PERIOD:
+            self.cornering_last_report_time = now
+            self.get_logger().info(
+                f"CORNERING_DETECT running yes={int(is_yes)} held={held:.2f}/"
+                f"{CORNERING_DETECT_HOLD_TIME:.2f}s "
+                f"det=({class_id},{class_name},{probability:.2f})"
+            )
+
+        return self.cornering_confirmed
+
+    def start_corner_drive(self, now):
+        if self.state != STATE_LANE or self.overtake_monitor_enabled:
+            self.reset_cornering_detection()
+            return False
+
+        if self.cornering_lane_driver is None or self.front_image is None:
+            self.get_logger().warning("CORNERING_DRIVE skipped: driver or front image is not ready")
+            self.reset_cornering_detection()
+            return False
+
+        self.cornering_lane_driver.reset()
+        self.reset_lane_pulse()
+        self.cornering_no_start_time = None
+        self.last_log_time = now
+        self.get_logger().info(
+            f"CORNERING_DETECT confirmed for {CORNERING_DETECT_HOLD_TIME:.1f}s "
+            f"-> MODEL SWITCH LANE -> CORNER_DRIVE camera model ON"
+        )
+        self.set_state(STATE_CORNER_DRIVE)
+        return True
+
+    def update_cornering_drive_release(self, now):
+        if self.cornering_detector is None or self.front_image is None:
+            if self.cornering_no_start_time is None:
+                self.cornering_no_start_time = now
+            return now - self.cornering_no_start_time >= CORNERING_CLEAR_HOLD_TIME
+
+        class_id, probability, class_name = self.cornering_detector.process(self.front_image, now)
+        self.cornering_raw_class_id = class_id
+        self.cornering_raw_class_name = class_name
+        self.cornering_raw_prob = probability
+
+        is_yes = class_id == CLASS_CORNERING and probability >= CORNERING_DETECT_THRESHOLD
+        if is_yes:
+            self.cornering_no_start_time = None
+            self.cornering_candidate_start_time = now
+        else:
+            if self.cornering_no_start_time is None:
+                self.cornering_no_start_time = now
+
+        no_held = 0.0 if self.cornering_no_start_time is None else now - self.cornering_no_start_time
+        if now - self.cornering_last_report_time >= CORNERING_LOG_PERIOD:
+            self.cornering_last_report_time = now
+            self.get_logger().info(
+                f"CORNERING_DRIVE detect yes={int(is_yes)} no_held={no_held:.2f}/"
+                f"{CORNERING_CLEAR_HOLD_TIME:.2f}s "
+                f"det=({class_id},{class_name},{probability:.2f})"
+            )
+
+        return no_held >= CORNERING_CLEAR_HOLD_TIME
+
+    def finish_corner_drive(self, now, reason):
+        self.get_logger().info(f"MODEL SWITCH CORNER_DRIVE -> LANE reason={reason}")
+        if self.lane_driver is not None:
+            self.lane_driver.reset()
+        self.reset_lane_pulse()
+        self.reset_cornering_detection()
+        if self.cornering_detector is not None:
+            self.cornering_detector.reset()
         self.set_state(STATE_LANE)
 
     def pulse_lane_command(self, driver, target_angle, speed):
@@ -1086,6 +1270,38 @@ class TrackDriverNode(Node):
             return False
         return True
 
+    def has_shortcut_camera_decision(self, shortcut_cache):
+        if not shortcut_cache["ready"]:
+            return False
+        return (
+            shortcut_cache["open_votes"] >= SHORTCUT_MIN_OPEN_VOTES
+            or shortcut_cache["blocked_votes"] >= SHORTCUT_MIN_OPEN_VOTES
+        )
+
+    def should_trigger_shortcut_by_camera_with_traffic(self, now, shortcut_cache):
+        # 카메라가 먼저 지름길 YES/NO를 잡고 신호등도 보이면, group 2초 확정 전이라도
+        # 라이다 융합 판단으로 들어가 속도 10 저속 주행을 시작한다.
+        if not SHORTCUT_CHECK_ENABLED or self.shortcut_done or self.shortcut_left_taken:
+            return False
+        if not self.traffic_visible:
+            return False
+        if self.route_signal_count >= ROUTE_SIGNAL_TOTAL:
+            self.shortcut_done = True
+            return False
+        if self.lane_start_time is None:
+            return False
+        if now - self.lane_start_time < TRAFFIC_GROUP_MIN_LANE_TIME:
+            return False
+        if not self.traffic_group_armed:
+            return False
+        if self.signal_clock - self.traffic_group_last_clock < ROUTE_SIGNAL_COOLDOWN:
+            return False
+
+        next_group = self.traffic_group_count + 1
+        if not self.is_shortcut_traffic_group(next_group):
+            return False
+        return self.has_shortcut_camera_decision(shortcut_cache)
+
     def claim_shortcut_group_by_camera(self, now, shortcut_cache):
         next_group = self.next_shortcut_group_index()
         if next_group > TRAFFIC_GROUP_TOTAL:
@@ -1195,6 +1411,9 @@ class TrackDriverNode(Node):
 
         self.cone_lane_driver.reset()
         self.reset_lane_pulse()
+        self.reset_cornering_detection()
+        if self.cornering_detector is not None:
+            self.cornering_detector.reset()
         self.cone_move_start_time = None
         self.last_log_time = now
         self.set_state(STATE_CONE)
@@ -1227,6 +1446,9 @@ class TrackDriverNode(Node):
         self.shortcut_wait_signal_start_time = None
         self.stop_overtake_monitor("lane start reset")
         self.overtake_done_in_segment = False
+        self.reset_cornering_detection()
+        if self.cornering_detector is not None:
+            self.cornering_detector.reset()
         self.reset_shortcut_cache()
         self.reset_shortcut_detectors()
         if self.traffic_visible:
@@ -1456,6 +1678,11 @@ class TrackDriverNode(Node):
                 self.shortcut_done = True
         elif signal_kind == "middle":
             self.stop_overtake_monitor("middle signal reached")
+        elif self.should_trigger_shortcut_by_camera_with_traffic(now, shortcut_cache):
+            if self.claim_shortcut_group_by_camera(now, shortcut_cache):
+                self.stop_overtake_monitor("shortcut claimed by camera+traffic before group confirm")
+                if self.handle_shortcut_signal_decision(now, shortcut_cache, "camera+traffic"):
+                    return
         elif self.should_trigger_shortcut_by_camera(now, shortcut_cache):
             if self.claim_shortcut_group_by_camera(now, shortcut_cache):
                 self.stop_overtake_monitor("shortcut claimed by camera")
@@ -1471,6 +1698,11 @@ class TrackDriverNode(Node):
         if self.update_overtake_monitor(now):
             if self.start_overtake_drive(now):
                 self.run_overtake_drive(now)
+                return
+
+        if self.update_cornering_monitor(now):
+            if self.start_corner_drive(now):
+                self.run_corner_drive(now)
                 return
 
         self.run_model_drive(self.lane_driver, now)
@@ -1628,6 +1860,18 @@ class TrackDriverNode(Node):
 
         self.run_model_drive(self.overtake_camera_driver, now)
 
+    def run_corner_drive(self, now):
+        # 연속 코너링 구간에서는 지름길/추월 판단을 끄고 코너링 전용 주행 모델만 쓴다.
+        if self.update_cornering_drive_release(now):
+            self.finish_corner_drive(
+                now,
+                f"cornering no held for {CORNERING_CLEAR_HOLD_TIME:.1f}s",
+            )
+            self.run_model_drive(self.lane_driver, now)
+            return
+
+        self.run_model_drive(self.cornering_lane_driver, now)
+
     def control_loop(self):
         now = time.monotonic()
         self.update_signal_clock(now)
@@ -1655,6 +1899,8 @@ class TrackDriverNode(Node):
             self.run_shortcut_drive(now)
         elif self.state == STATE_OVERTAKE_DRIVE:
             self.run_overtake_drive(now)
+        elif self.state == STATE_CORNER_DRIVE:
+            self.run_corner_drive(now)
         else:
             self.drive(0.0, STOP_SPEED)
 
@@ -1672,6 +1918,8 @@ class TrackDriverNode(Node):
             active_drive = self.shortcut_lane_driver
         elif self.state == STATE_OVERTAKE_DRIVE:
             active_drive = self.overtake_camera_driver
+        elif self.state == STATE_CORNER_DRIVE:
+            active_drive = self.cornering_lane_driver
         else:
             active_drive = self.lane_driver
 
@@ -1707,6 +1955,12 @@ class TrackDriverNode(Node):
                 0.0,
                 OVERTAKE_FORCE_AFTER_LAST_YES_TIME - (now - self.overtake_last_yes_time),
             )
+        cornering_hold = 0.0
+        if self.cornering_candidate_start_time is not None:
+            cornering_hold = now - self.cornering_candidate_start_time
+        cornering_no_hold = 0.0
+        if self.cornering_no_start_time is not None:
+            cornering_no_hold = now - self.cornering_no_start_time
         traffic_hold = 0.0
         if self.traffic_candidate_start_time is not None:
             traffic_hold = now - self.traffic_candidate_start_time
@@ -1738,6 +1992,10 @@ class TrackDriverNode(Node):
             f"{OVERTAKE_DETECT_HOLD_TIME:.2f},{int(self.overtake_confirmed)},"
             f"no={overtake_no_hold:.2f},force={overtake_force_left:.2f}/"
             f"{OVERTAKE_FORCE_AFTER_LAST_YES_TIME:.2f}) "
+            f"corner=({self.cornering_raw_class_id},{self.cornering_raw_class_name},"
+            f"{self.cornering_raw_prob:.2f},{cornering_hold:.2f}/"
+            f"{CORNERING_DETECT_HOLD_TIME:.2f},{int(self.cornering_confirmed)},"
+            f"no={cornering_no_hold:.2f}/{CORNERING_CLEAR_HOLD_TIME:.2f}) "
             f"pulse=({pulse_angle:.1f},{pulse_ticks}) "
             f"cmd=({self.motor_msg.angle:.0f},{self.motor_msg.speed:.0f})"
         )

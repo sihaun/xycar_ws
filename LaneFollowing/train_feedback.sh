@@ -12,7 +12,7 @@ fi
 python3 Feedback/train_direction_feedback.py \
   --base-dataset-dir LaneFollowing/dataset_xy \
   --feedback-dataset-dir LaneFollowing/feedback_dataset_xy \
-  --initial-model-path "$BEST" \
+  --initial-model-path "$BACKUP" \
   --best-model-path "$BEST" \
   --last-model-path "$LAST" \
   --feedback-weight 3.0 \

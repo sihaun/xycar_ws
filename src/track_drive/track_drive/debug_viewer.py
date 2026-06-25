@@ -3,7 +3,7 @@
 #=============================================
 # 통합 미션 디버그 뷰어
 # - 전방 카메라 원본/신호등 crop과 라이다 BEV를 함께 띄운다.
-# - CLI는 신호등/지름길 라이다/추월 카메라/라바콘 이벤트만 출력한다.
+# - CLI는 신호등/지름길/추월/연속코너/라바콘 이벤트만 출력한다.
 #=============================================
 
 import argparse
@@ -22,16 +22,19 @@ try:
     from track_drive.traffic_light_model import CLASS_NONE, CLASS_NAMES as TRAFFIC_CLASS_NAMES, TrafficLightClassifier
     from track_drive.shortcut_drive import ShortcutCameraDetector, ShortcutDetector, make_occupancy_image
     from track_drive.overtake_drive import CLASS_OVERTAKE, OvertakeCameraDetector
+    from track_drive.corner_drive import CLASS_CORNERING, CorneringCameraDetector
 except ImportError:
     from traffic_light_model import CLASS_NONE, CLASS_NAMES as TRAFFIC_CLASS_NAMES, TrafficLightClassifier
     from shortcut_drive import ShortcutCameraDetector, ShortcutDetector, make_occupancy_image
     from overtake_drive import CLASS_OVERTAKE, OvertakeCameraDetector
+    from corner_drive import CLASS_CORNERING, CorneringCameraDetector
 
 
 DEFAULT_TRAFFIC_MODEL_PATH = "/home/xytron/xycar_ws/TrafficLight/best_traffic_light_resnet18.pth"
 DEFAULT_SHORTCUT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect/best_shortcut_resnet18.pth"
 DEFAULT_SHORTCUT_CAMERA_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect_cam/best_shortcut_cam_resnet18.pth"
 DEFAULT_OVERTAKE_MODEL_PATH = "/home/xytron/xycar_ws/Overtake/overtake_detect_cam/best_overtake_detect_cam_resnet18.pth"
+DEFAULT_CORNERING_MODEL_PATH = "/home/xytron/xycar_ws/Cornering/corner_detect/best_corner_detect_resnet18.pth"
 DEFAULT_CAMERA_TOPIC = "/usb_cam/image_raw/front"
 DEFAULT_SCAN_TOPIC = "/scan"
 DEFAULT_CROP = (160, 20, 360, 170)
@@ -61,6 +64,7 @@ class MissionDebugViewer(Node):
         self.last_lidar_report_time = 0.0
         self.last_shortcut_camera_report_time = 0.0
         self.last_overtake_report_time = 0.0
+        self.last_cornering_report_time = 0.0
         self.traffic_visible = False
         self.candidate_start_time = None
         self.signal_count = 0
@@ -101,6 +105,13 @@ class MissionDebugViewer(Node):
         self.overtake_clear_start_time = None
         self.overtake_segment_active = False
         self.overtake_segment_start_time = None
+        self.cornering_raw_class_id = 0
+        self.cornering_raw_class_name = "none"
+        self.cornering_raw_prob = 0.0
+        self.cornering_candidate_start_time = None
+        self.cornering_clear_start_time = None
+        self.cornering_segment_active = False
+        self.cornering_segment_start_time = None
 
         self.classifier = TrafficLightClassifier(
             model_path=args.traffic_model,
@@ -124,6 +135,11 @@ class MissionDebugViewer(Node):
             model_path=args.overtake_model,
             device=args.device,
             inference_period=args.overtake_inference_period,
+        )
+        self.cornering_detector = CorneringCameraDetector(
+            model_path=args.cornering_model,
+            device=args.device,
+            inference_period=args.cornering_inference_period,
         )
 
         if not os.environ.get("DISPLAY"):
@@ -149,7 +165,7 @@ class MissionDebugViewer(Node):
         self.create_subscription(LaserScan, args.scan_topic, self.scan_callback, qos_profile_sensor_data)
         self.create_timer(0.05, self.timer_callback)
         self.get_logger().info(
-            "debug viewer started: traffic + shortcut camera/lidar + overtake camera events"
+            "debug viewer started: traffic + shortcut camera/lidar + overtake/cornering camera events"
         )
 
     def destroy_node(self):
@@ -183,6 +199,21 @@ class MissionDebugViewer(Node):
                 self.last_overtake_report_time = now
                 self.get_logger().info(
                     f"RAW overtake_camera=({overtake_class_id},{overtake_class_name},{overtake_prob:.2f})"
+                )
+
+        prev_cornering_infer_time = self.cornering_detector.last_infer_time
+        cornering_class_id, cornering_prob, cornering_class_name = self.cornering_detector.process(image, now)
+        new_cornering_inference = self.cornering_detector.last_infer_time > prev_cornering_infer_time
+        self.cornering_raw_class_id = cornering_class_id
+        self.cornering_raw_class_name = cornering_class_name
+        self.cornering_raw_prob = cornering_prob
+        self.update_cornering_event_log(now)
+
+        if self.args.log_all and new_cornering_inference:
+            if now - self.last_cornering_report_time >= self.args.report_period:
+                self.last_cornering_report_time = now
+                self.get_logger().info(
+                    f"RAW cornering_camera=({cornering_class_id},{cornering_class_name},{cornering_prob:.2f})"
                 )
 
         prev_shortcut_cam_infer_time = self.shortcut_camera_detector.last_infer_time
@@ -361,6 +392,61 @@ class MissionDebugViewer(Node):
         )
         self.get_logger().info(
             "MODEL SWITCH OVERTAKE_DRIVE -> LANE reason=overtake_no_confirmed"
+        )
+
+    def update_cornering_event_log(self, now):
+        is_cornering = (
+            self.cornering_raw_class_id == CLASS_CORNERING
+            and self.cornering_raw_prob >= self.args.cornering_prob
+        )
+        cone_active = self.cone_started and not self.cone_finished
+        if cone_active or self.shortcut_segment_active or self.overtake_segment_active:
+            self.cornering_candidate_start_time = None
+            self.cornering_clear_start_time = None
+            return
+
+        if is_cornering:
+            self.cornering_clear_start_time = None
+            if self.cornering_candidate_start_time is None:
+                self.cornering_candidate_start_time = now
+                return
+
+            held = now - self.cornering_candidate_start_time
+            if held < self.args.cornering_trust_time:
+                return
+            if self.cornering_segment_active:
+                return
+
+            self.cornering_segment_active = True
+            self.cornering_segment_start_time = now
+            self.get_logger().info(
+                f"CORNERING SEGMENT ENTER source=front_cam "
+                f"det=({self.cornering_raw_class_id},{self.cornering_raw_class_name},{self.cornering_raw_prob:.2f}) "
+                f"held={held:.2f}s"
+            )
+            self.get_logger().info(
+                "MODEL SWITCH LANE -> CORNER_DRIVE reason=cornering_yes_confirmed"
+            )
+            return
+
+        self.cornering_candidate_start_time = None
+        if not self.cornering_segment_active:
+            return
+        if self.cornering_clear_start_time is None:
+            self.cornering_clear_start_time = now
+            return
+        if now - self.cornering_clear_start_time < self.args.cornering_clear_time:
+            return
+
+        elapsed = now - self.cornering_segment_start_time if self.cornering_segment_start_time else 0.0
+        self.cornering_segment_active = False
+        self.cornering_segment_start_time = None
+        self.cornering_clear_start_time = None
+        self.get_logger().info(
+            f"CORNERING SEGMENT EXIT source=front_cam_clear elapsed={elapsed:.2f}s"
+        )
+        self.get_logger().info(
+            "MODEL SWITCH CORNER_DRIVE -> LANE reason=cornering_no_confirmed"
         )
 
     def update_traffic_event_log(self, class_id, probability, class_name, probs, now):
@@ -599,6 +685,52 @@ class MissionDebugViewer(Node):
 
         return panel
 
+    def put_status_row(
+        self,
+        image,
+        y,
+        label,
+        status,
+        detail,
+        status_color,
+        label_x=12,
+        status_x=148,
+        detail_x=220,
+        label_scale=0.50,
+        status_scale=0.56,
+        detail_scale=0.42,
+    ):
+        cv2.putText(
+            image,
+            label,
+            (label_x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            label_scale,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            status,
+            (status_x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            status_scale,
+            status_color,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            detail,
+            (detail_x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            detail_scale,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+
     def make_front_camera_view(self, image):
         if image.size == 0:
             image = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -616,8 +748,16 @@ class MissionDebugViewer(Node):
             and self.overtake_raw_prob >= self.args.overtake_prob
         )
         overtake_status = "YES" if overtake_yes else "NO"
-        active = "ON" if self.overtake_segment_active else "off"
+        overtake_active = "ON" if self.overtake_segment_active else "off"
         overtake_color = (0, 255, 255) if self.overtake_segment_active else (0, 255, 0) if overtake_yes else (80, 80, 255)
+
+        cornering_yes = (
+            self.cornering_raw_class_id == CLASS_CORNERING
+            and self.cornering_raw_prob >= self.args.cornering_prob
+        )
+        cornering_status = "YES" if cornering_yes else "NO"
+        cornering_active = "ON" if self.cornering_segment_active else "off"
+        cornering_color = (0, 255, 255) if self.cornering_segment_active else (0, 255, 0) if cornering_yes else (80, 80, 255)
 
         shortcut_name = self.shortcut_cam_raw_class_name
         if shortcut_name == "open" and self.shortcut_cam_raw_open_prob >= self.args.shortcut_open_threshold:
@@ -630,50 +770,53 @@ class MissionDebugViewer(Node):
             shortcut_status = "NONE"
             shortcut_color = (210, 210, 210)
 
-        overlay_h = 126
+        overlay_h = 154
         cv2.rectangle(view, (0, 0), (view.shape[1], overlay_h), (0, 0, 0), -1)
-        cv2.putText(
+        self.put_status_row(
             view,
-            f"SHORTCUT CAM {shortcut_status}  open={self.shortcut_cam_raw_open_prob:.2f}  "
-            f"blocked={self.shortcut_cam_raw_blocked_prob:.2f}  none={self.shortcut_cam_raw_none_prob:.2f}",
-            (12, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.78,
+            28,
+            "SHORTCUT",
+            shortcut_status,
+            f"cam raw={shortcut_name} open={self.shortcut_cam_raw_open_prob:.2f} "
+            f"blocked={self.shortcut_cam_raw_blocked_prob:.2f} none={self.shortcut_cam_raw_none_prob:.2f}",
             shortcut_color,
-            2,
-            cv2.LINE_AA,
         )
-        cv2.putText(
+        self.put_status_row(
             view,
-            f"OVERTAKE {overtake_status}  prob={self.overtake_raw_prob:.2f}  segment={active}",
-            (12, 58),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.66,
+            56,
+            "OVERTAKE",
+            overtake_status,
+            f"raw=({self.overtake_raw_class_id},{self.overtake_raw_class_name}) "
+            f"prob={self.overtake_raw_prob:.2f} segment={overtake_active}",
             overtake_color,
-            2,
-            cv2.LINE_AA,
         )
-        cv2.putText(
+        self.put_status_row(
             view,
-            f"shortcut_raw={shortcut_name} threshold={self.args.shortcut_open_threshold:.2f}  "
-            f"overtake_raw=({self.overtake_raw_class_id},{self.overtake_raw_class_name}) threshold={self.args.overtake_prob:.2f}",
-            (12, 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (235, 235, 235),
-            1,
-            cv2.LINE_AA,
+            84,
+            "CORNERING",
+            cornering_status,
+            f"raw=({self.cornering_raw_class_id},{self.cornering_raw_class_name}) "
+            f"prob={self.cornering_raw_prob:.2f} segment={cornering_active}",
+            cornering_color,
         )
-        cv2.putText(
+        self.put_status_row(
             view,
-            f"group={self.group_label(self.current_group)} round={self.round_count}/{self.args.round_total}  "
-            f"shortcut_seg={int(self.shortcut_segment_active)} cone={int(self.cone_started)}/{int(self.cone_finished)}",
-            (12, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            112,
+            "GROUP",
+            self.group_label(self.current_group),
+            f"round={self.round_count}/{self.args.round_total} cone={int(self.cone_started)}/{int(self.cone_finished)}",
             (210, 230, 255),
-            1,
-            cv2.LINE_AA,
+            status_scale=0.48,
+        )
+        self.put_status_row(
+            view,
+            140,
+            "SEGMENT",
+            "ON" if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else "off",
+            f"shortcut={int(self.shortcut_segment_active)} overtake={int(self.overtake_segment_active)} "
+            f"corner={int(self.cornering_segment_active)}",
+            (0, 255, 255) if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else (210, 210, 210),
+            status_scale=0.48,
         )
         return view
 
@@ -687,7 +830,7 @@ class MissionDebugViewer(Node):
         scale = max(float(self.args.lidar_scale), 1.0)
         view = cv2.resize(view, (int(view.shape[1] * scale), int(view.shape[0] * scale)))
 
-        panel_h = 126
+        panel_h = 150
         panel = cv2.copyMakeBorder(view, 0, panel_h, 0, 0, cv2.BORDER_CONSTANT, value=(20, 20, 20))
         y0 = view.shape[0] + 24
 
@@ -695,42 +838,82 @@ class MissionDebugViewer(Node):
         shortcut_text = "YES" if shortcut_trusted == "open" else "NO" if shortcut_trusted == "blocked" else "NONE"
         raw_shortcut = self.lidar_raw_class_name
         raw_shortcut_text = "YES" if raw_shortcut == "open" else "NO" if raw_shortcut == "blocked" else "NONE"
-        cv2.putText(
+        self.put_status_row(
             panel,
-            f"shortcut trusted={shortcut_text} raw={raw_shortcut_text}",
-            (12, y0),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            y0,
+            "SHORTCUT",
+            shortcut_text,
+            f"lidar raw={raw_shortcut_text} o={self.lidar_raw_open_prob:.2f} "
+            f"b={self.lidar_raw_blocked_prob:.2f} n={self.lidar_raw_none_prob:.2f}",
             (0, 255, 0) if shortcut_trusted == "open" else (0, 180, 255) if shortcut_trusted == "blocked" else (220, 220, 220),
-            1,
-        )
-        cv2.putText(
-            panel,
-            f"open={self.lidar_raw_open_prob:.2f} blocked={self.lidar_raw_blocked_prob:.2f} none={self.lidar_raw_none_prob:.2f}",
-            (12, y0 + 26),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
-            (230, 230, 230),
-            1,
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.46,
+            detail_scale=0.34,
         )
         overtake_active = "ON" if self.overtake_segment_active else "off"
-        cv2.putText(
-            panel,
-            f"overtake={overtake_active} raw=({self.overtake_raw_class_id},{self.overtake_raw_class_name},{self.overtake_raw_prob:.2f})",
-            (12, y0 + 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 255, 255) if self.overtake_segment_active else (230, 230, 230),
-            1,
+        overtake_yes = (
+            self.overtake_raw_class_id == CLASS_OVERTAKE
+            and self.overtake_raw_prob >= self.args.overtake_prob
         )
-        cv2.putText(
+        self.put_status_row(
             panel,
-            f"cone={'done' if self.cone_finished else 'on' if self.cone_started else 'wait'} shortcut_seg={int(self.shortcut_segment_active)}",
-            (12, y0 + 84),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            y0 + 28,
+            "OVERTAKE",
+            "YES" if overtake_yes else "NO",
+            f"raw=({self.overtake_raw_class_id},{self.overtake_raw_class_name}) p={self.overtake_raw_prob:.2f} seg={overtake_active}",
+            (0, 255, 255) if self.overtake_segment_active else (230, 230, 230),
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.46,
+            detail_scale=0.34,
+        )
+        cornering_active = "ON" if self.cornering_segment_active else "off"
+        cornering_yes = (
+            self.cornering_raw_class_id == CLASS_CORNERING
+            and self.cornering_raw_prob >= self.args.cornering_prob
+        )
+        self.put_status_row(
+            panel,
+            y0 + 56,
+            "CORNERING",
+            "YES" if cornering_yes else "NO",
+            f"raw=({self.cornering_raw_class_id},{self.cornering_raw_class_name}) p={self.cornering_raw_prob:.2f} seg={cornering_active}",
+            (0, 255, 255) if self.cornering_segment_active else (230, 230, 230),
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.46,
+            detail_scale=0.34,
+        )
+        self.put_status_row(
+            panel,
+            y0 + 84,
+            "SEGMENT",
+            "ON" if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else "off",
+            f"shortcut={int(self.shortcut_segment_active)} overtake={int(self.overtake_segment_active)} "
+            f"corner={int(self.cornering_segment_active)}",
+            (0, 255, 255) if (self.shortcut_segment_active or self.overtake_segment_active or self.cornering_segment_active) else (230, 230, 230),
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.46,
+            detail_scale=0.34,
+        )
+        self.put_status_row(
+            panel,
+            y0 + 112,
+            "CONE",
+            "done" if self.cone_finished else "on" if self.cone_started else "wait",
+            f"group={self.group_label(self.current_group)} round={self.round_count}/{self.args.round_total}",
             (230, 230, 230),
-            1,
+            status_x=140,
+            detail_x=206,
+            label_scale=0.44,
+            status_scale=0.42,
+            detail_scale=0.34,
         )
         return panel
 
@@ -743,12 +926,14 @@ def parse_args():
     parser.add_argument("--shortcut-model", default=DEFAULT_SHORTCUT_MODEL_PATH)
     parser.add_argument("--shortcut-camera-model", default=DEFAULT_SHORTCUT_CAMERA_MODEL_PATH)
     parser.add_argument("--overtake-model", default=DEFAULT_OVERTAKE_MODEL_PATH)
+    parser.add_argument("--cornering-model", default=DEFAULT_CORNERING_MODEL_PATH)
     parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="cuda")
     parser.add_argument("--crop", type=parse_crop, default=DEFAULT_CROP)
     parser.add_argument("--traffic-inference-period", type=float, default=0.02)
     parser.add_argument("--lidar-inference-period", type=float, default=0.08)
     parser.add_argument("--shortcut-camera-inference-period", type=float, default=0.02)
     parser.add_argument("--overtake-inference-period", type=float, default=0.02)
+    parser.add_argument("--cornering-inference-period", type=float, default=0.02)
     parser.add_argument("--report-period", type=float, default=0.2)
     parser.add_argument("--visible-prob", type=float, default=0.55)
     parser.add_argument("--trust-time", type=float, default=0.6)
@@ -758,6 +943,9 @@ def parse_args():
     parser.add_argument("--overtake-prob", type=float, default=0.70)
     parser.add_argument("--overtake-trust-time", type=float, default=2.0)
     parser.add_argument("--overtake-clear-time", type=float, default=3.0)
+    parser.add_argument("--cornering-prob", type=float, default=0.70)
+    parser.add_argument("--cornering-trust-time", type=float, default=0.6)
+    parser.add_argument("--cornering-clear-time", type=float, default=1.0)
     parser.add_argument("--clear-time", type=float, default=0.8)
     parser.add_argument("--cone-seconds", type=float, default=5.0)
     parser.add_argument("--shortcut-segment-max-time", type=float, default=20.0)
