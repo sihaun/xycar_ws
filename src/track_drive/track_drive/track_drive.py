@@ -1661,6 +1661,8 @@ class TrackDriverNode(Node):
     def current_shortcut_signal_index(self):
         if self.pending_shortcut_route_signal > 0:
             return self.pending_shortcut_route_signal
+        if self.is_active_shortcut_signal():
+            return max(self.route_signal_count, (self.active_traffic_group + 1) // 2)
         return self.route_signal_count
 
     def shortcut_detector_supports_none(self):
@@ -2540,9 +2542,9 @@ class TrackDriverNode(Node):
 
         self.log_info(
             f"SHORTCUT_DETECT live check starts at shortcut signal source={source}: "
-            f"camera decision visible -> stop and wait until camera+lidar YES/NO is confirmed"
+            f"camera decision visible -> crawl until camera+lidar YES/NO is confirmed"
         )
-        self.start_shortcut_check(now, stop_for_decision=True)
+        self.start_shortcut_check(now, stop_for_decision=False)
         if self.state == STATE_SHORTCUT_CHECK:
             self.run_shortcut_check(now)
             return True
@@ -3076,7 +3078,9 @@ class TrackDriverNode(Node):
             f"hold={self.green_count} tl_hold={traffic_hold:.2f}/{TRAFFIC_GROUP_CONFIRM_TIME:.2f} "
             f"group={self.traffic_group_count}/{TRAFFIC_GROUP_TOTAL} "
             f"active_group={self.active_traffic_group} "
-            f"route={self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} round={self.round_count}/{ROUND_TOTAL} "
+            f"route={self.route_signal_count}/{ROUTE_SIGNAL_TOTAL} "
+            f"eff_route={self.current_shortcut_signal_index()}/{ROUTE_SIGNAL_TOTAL} "
+            f"round={self.round_count}/{ROUND_TOTAL} "
             f"sigclk={self.signal_clock:.1f} "
             f"cone={cone_elapsed:.2f}/{CONE_MODEL_SECONDS:.2f} "
             f"dir=({lane_vx:.2f},{lane_vy:.2f}) steer={lane_steer:.1f} "
