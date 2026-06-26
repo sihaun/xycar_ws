@@ -93,6 +93,7 @@ class MissionDebugViewer(Node):
         self.cone_started = False
         self.cone_finished = False
         self.cone_start_time = None
+        self.route_tracking_started = False
 
         self.lidar_raw_class_name = LIDAR_NONE
         self.lidar_raw_open_prob = 0.0
@@ -215,6 +216,58 @@ class MissionDebugViewer(Node):
     def log_error(self, message):
         self.get_logger().error(f"{self.log_prefix()} {message}")
 
+    def start_route_tracking(self, now, reason):
+        if self.route_tracking_started:
+            return
+        self.cone_finished = True
+        self.route_tracking_started = True
+        self.traffic_visible = False
+        self.candidate_start_time = None
+        self.signal_count = 1
+        self.group_count = 0
+        self.round_count = 0
+        self.current_group = 0
+        self.light_first_seen_time = 0.0
+        self.last_visible_time = 0.0
+        self.last_signal_class_id = CLASS_NONE
+        self.last_signal_probability = 0.0
+        self.last_shortcut_zone_group = 0
+        self.shortcut_open_logged_group = 0
+        self.shortcut_blocked_logged_group = 0
+        self.schoolzone_candidate_start_time = None
+        self.schoolzone_held = 0.0
+        self.schoolzone_active = False
+        self.log_info(f"ROUTE TRACKING START after cone: {reason}")
+
+    def update_pre_route_cone_start(self, class_id, probability, class_name, now):
+        if self.cone_started:
+            return
+        if class_id == CLASS_GREEN and probability >= self.args.visible_prob:
+            if self.candidate_start_time is None:
+                self.candidate_start_time = now
+            if now - self.candidate_start_time >= self.args.trust_time:
+                self.cone_started = True
+                self.cone_start_time = now
+                if self.mission_log_start_time is None:
+                    self.mission_log_start_time = now
+                self.log_info(
+                    f"CONE START inferred_from_start_green "
+                    f"signal=({class_id},{class_name},{probability:.2f})"
+                )
+                self.log_info(
+                    "VIEWER INFER MODEL SWITCH WAIT_GREEN -> CONEDRIVE reason=start_green"
+                )
+        else:
+            self.candidate_start_time = None
+
+    def reset_schoolzone_pre_route(self):
+        self.schoolzone_raw_class_id = 0
+        self.schoolzone_raw_class_name = "none"
+        self.schoolzone_raw_prob = 0.0
+        self.schoolzone_candidate_start_time = None
+        self.schoolzone_held = 0.0
+        self.schoolzone_active = False
+
     def image_callback(self, msg):
         image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         now = time.monotonic()
@@ -226,7 +279,10 @@ class MissionDebugViewer(Node):
         if self.show_enabled:
             self.latest_traffic_view = self.make_traffic_view(crop, class_id, class_name, probability, probs)
 
-        self.update_traffic_event_log(class_id, probability, class_name, probs, now)
+        if self.route_tracking_started:
+            self.update_traffic_event_log(class_id, probability, class_name, probs, now)
+        else:
+            self.update_pre_route_cone_start(class_id, probability, class_name, now)
 
         prev_overtake_infer_time = self.overtake_detector.last_infer_time
         overtake_class_id, overtake_prob, overtake_class_name = self.overtake_detector.process(image, now)
@@ -258,21 +314,24 @@ class MissionDebugViewer(Node):
                     f"RAW cornering_camera=({cornering_class_id},{cornering_class_name},{cornering_prob:.2f})"
                 )
 
-        prev_schoolzone_infer_time = self.schoolzone_detector.last_infer_time
-        schoolzone_class_id, schoolzone_prob, schoolzone_class_name = self.schoolzone_detector.process(image, now)
-        new_schoolzone_inference = self.schoolzone_detector.last_infer_time > prev_schoolzone_infer_time
-        self.schoolzone_raw_class_id = schoolzone_class_id
-        self.schoolzone_raw_class_name = schoolzone_class_name
-        self.schoolzone_raw_prob = schoolzone_prob
-        self.update_schoolzone_event_log(now)
+        if self.route_tracking_started:
+            prev_schoolzone_infer_time = self.schoolzone_detector.last_infer_time
+            schoolzone_class_id, schoolzone_prob, schoolzone_class_name = self.schoolzone_detector.process(image, now)
+            new_schoolzone_inference = self.schoolzone_detector.last_infer_time > prev_schoolzone_infer_time
+            self.schoolzone_raw_class_id = schoolzone_class_id
+            self.schoolzone_raw_class_name = schoolzone_class_name
+            self.schoolzone_raw_prob = schoolzone_prob
+            self.update_schoolzone_event_log(now)
 
-        if self.args.log_all and new_schoolzone_inference:
-            if now - self.last_schoolzone_report_time >= self.args.report_period:
-                self.last_schoolzone_report_time = now
-                self.log_info(
-                    f"RAW schoolzone_camera=({schoolzone_class_id},{schoolzone_class_name},"
-                    f"{schoolzone_prob:.2f})"
-                )
+            if self.args.log_all and new_schoolzone_inference:
+                if now - self.last_schoolzone_report_time >= self.args.report_period:
+                    self.last_schoolzone_report_time = now
+                    self.log_info(
+                        f"RAW schoolzone_camera=({schoolzone_class_id},{schoolzone_class_name},"
+                        f"{schoolzone_prob:.2f})"
+                    )
+        else:
+            self.reset_schoolzone_pre_route()
 
         prev_shortcut_cam_infer_time = self.shortcut_camera_detector.last_infer_time
         self.shortcut_camera_detector.process(image, now)
@@ -329,6 +388,12 @@ class MissionDebugViewer(Node):
     def apply_driver_model_switch(self, switch_text, now):
         if "WAIT_GREEN -> CONEDRIVE" in switch_text and self.mission_log_start_time is None:
             self.mission_log_start_time = now
+            self.cone_started = True
+            self.cone_start_time = now
+
+        if "CONEDRIVE -> LANE" in switch_text:
+            self.start_route_tracking(now, "driver cone_finished")
+            return
 
         if "-> SHORTCUT_DRIVE" in switch_text:
             self.shortcut_segment_active = True
@@ -397,16 +462,6 @@ class MissionDebugViewer(Node):
 
     def timer_callback(self):
         now = time.monotonic()
-        if self.cone_started and not self.cone_finished and self.cone_start_time is not None:
-            if now - self.cone_start_time >= self.args.cone_seconds:
-                self.cone_finished = True
-                self.log_info(
-                    f"CONE END -> LANE START elapsed={now - self.cone_start_time:.2f}s"
-                )
-                self.log_info(
-                    "VIEWER INFER MODEL SWITCH CONEDRIVE -> LANE reason=cone_finished"
-                )
-
         if (
             self.args.shortcut_segment_max_time > 0.0
             and self.shortcut_segment_active
@@ -662,6 +717,19 @@ class MissionDebugViewer(Node):
         self.traffic_visible = True
         self.signal_count += 1
         self.current_group = max(0, self.signal_count - 1)
+        corrected_from_middle = False
+        if class_id == CLASS_RED_LEFT and self.is_middle_group(self.current_group):
+            skipped_middle = self.current_group
+            self.round_count = min(self.round_count + 1, self.args.round_total)
+            self.current_group += 1
+            self.signal_count = self.current_group + 1
+            corrected_from_middle = True
+            self.log_warning(
+                f"GROUP CORRECTION: signal class 4 red_left cannot be middle; "
+                f"skipped middle group={skipped_middle}/{self.args.group_total}, "
+                f"corrected_group={self.current_group}/{self.args.group_total}, "
+                f"round={self.round_count}/{self.args.round_total}"
+            )
         self.group_count = self.current_group
         self.light_first_seen_time = self.candidate_start_time or now
         self.last_signal_class_id = class_id
@@ -678,7 +746,8 @@ class MissionDebugViewer(Node):
         self.log_info(
             f"TRAFFIC FOUND group={self.group_label(self.current_group)} "
             f"kind={kind} signal=({class_id},{class_name},{probability:.2f}) "
-            f"confirmed_after={confirmed_after:.2f}s"
+            f"confirmed_after={confirmed_after:.2f}s "
+            f"corrected_from_middle={int(corrected_from_middle)}"
         )
 
         if kind == "shortcut" and self.last_shortcut_zone_group != self.current_group:
@@ -715,16 +784,42 @@ class MissionDebugViewer(Node):
         self.last_signal_class_id = CLASS_NONE
         self.last_signal_probability = 0.0
 
+    def correct_current_middle_to_shortcut_on_red_left(self, class_id):
+        if class_id != CLASS_RED_LEFT:
+            return False
+        if not self.is_middle_group(self.current_group):
+            return False
+
+        old_group = self.current_group
+        self.round_count = min(self.round_count + 1, self.args.round_total)
+        self.current_group += 1
+        self.signal_count = max(self.signal_count, self.current_group + 1)
+        self.group_count = self.current_group
+        self.log_warning(
+            f"GROUP CORRECTION: signal change class 4 red_left cannot be middle; "
+            f"group {old_group}->{self.current_group}, "
+            f"round={self.round_count}/{self.args.round_total}"
+        )
+        if self.last_shortcut_zone_group != self.current_group:
+            self.last_shortcut_zone_group = self.current_group
+            self.log_info(
+                f"SHORTCUT DECISION ZONE ENTER group={self.group_label(self.current_group)} "
+                f"round={self.round_count}/{self.args.round_total} mode=red_left_correction"
+            )
+        return True
+
     def log_signal_change(self, class_id, probability, class_name, now):
         old_id = self.last_signal_class_id
         old_name = self.class_name(old_id)
         old_prob = self.last_signal_probability
+        corrected_from_middle = self.correct_current_middle_to_shortcut_on_red_left(class_id)
         self.last_signal_class_id = class_id
         self.last_signal_probability = probability
         self.log_info(
             f"SIGNAL CHANGE group={self.group_label(self.current_group)} "
             f"({old_id},{old_name},{old_prob:.2f}) -> "
-            f"({class_id},{class_name},{probability:.2f})"
+            f"({class_id},{class_name},{probability:.2f}) "
+            f"corrected_from_middle={int(corrected_from_middle)}"
         )
         self.handle_trusted_signal_state(class_id, probability, class_name, now)
 
