@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#=============================================
-# track_drive 메인 주행 노드
-# - TrafficLight 모델로 초록불을 감지한 뒤 Conedrive 모델로 라바콘 구간을 통과한다.
-# - 라바콘 구간이 끝나면 기본 LaneFollowing 모델로 주행한다.
-# - 라바콘 이후 신호등 그룹 패턴을 세며 지름길 판단 신호등에서 카메라+라이다 퓨전 판단을 켠다.
-# - 지름길이 열려 있으면 정지한 뒤 빨강+좌회전 신호에서 지름길 전용 모델로 스위칭한다.
-# - 추월는 전방 카메라로 상황을 감지하고 전방 카메라 모델로 추월 주행한다.
-# - 연속 코너링 구간은 전방 카메라 감지 모델로 잡고 전용 주행 모델로 스위칭한다.
-#=============================================
+'''
+track_drive 메인 주행 노드
+- TrafficLight 모델로 초록불을 감지한 뒤 Conedrive 모델로 라바콘 구간을 통과한다.
+- 라바콘 구간이 끝나면 기본 LaneFollowing 모델로 주행한다.
+- 라바콘 이후 신호등 그룹 패턴을 세며 지름길 판단 신호등에서 카메라+라이다 퓨전 판단을 켠다.
+- 지름길이 열려 있으면 정지한 뒤 빨강+좌회전 신호에서 지름길 전용 모델로 스위칭한다.
+- 추월는 전방 카메라로 상황을 감지하고 전방 카메라 모델로 추월 주행한다.
+- 연속 코너링 구간은 전방 카메라 감지 모델로 잡고 전용 주행 모델로 스위칭한다.
+'''
 
 import math
 import time
@@ -129,9 +129,9 @@ except Exception as exc:
     TRAFFIC_LIGHT_IMPORT_ERROR = exc
 
 
-#=============================================
-# 튜닝값
-#=============================================
+'''============================================='''
+'''튜닝값'''
+'''============================================='''
 CONTROL_PERIOD = 0.02
 LOG_PERIOD = 0.1
 
@@ -149,7 +149,8 @@ STATE_STOP = "STOP"
 
 TRAFFIC_LIGHT_MODEL_PATH = "/home/xytron/xycar_ws/TrafficLight/best_traffic_light_resnet18.pth"
 TRAFFIC_LIGHT_DEVICE = "cuda"
-TRAFFIC_LIGHT_CROP = (160, 20, 360, 170)  # TrafficLight 수집 crop과 같은 값(x, y, w, h)
+TRAFFIC_LIGHT_CROP = (160, 20, 360, 170)
+'''TrafficLight 수집 crop과 같은 값(x, y, w, h)'''
 TRAFFIC_LIGHT_INFERENCE_PERIOD = 0.02
 TRAFFIC_VISIBLE_PROB = 0.55
 TRAFFIC_RED_STOP_PROB = 0.60
@@ -184,18 +185,24 @@ LANE_PULSE_DEADBAND = 5.0
 LANE_PULSE_TICKS = 2
 LANE_PULSE_SCALE = 1.0
 LANE_STEER_SPEED_MIN_RATIO = 0.20
-STEER_SPEED_MIN_RATIO = 0.35  # 별도 지정이 없는 주행은 최대 조향에서 이 비율까지 선형 감속한다.
-STEER_RECOVERY_HARD_RATIO = 0.45  # max_steer의 이 비율 이상이면 큰 조향으로 본다.
-STEER_RECOVERY_STRAIGHT_RATIO = 0.15  # max_steer의 이 비율 이하이면 직진에 가까운 조향으로 본다.
+STEER_SPEED_MIN_RATIO = 0.35
+'''별도 지정이 없는 주행은 최대 조향에서 이 비율까지 선형 감속한다.'''
+STEER_RECOVERY_HARD_RATIO = 0.45
+'''max_steer의 이 비율 이상이면 큰 조향으로 본다.'''
+STEER_RECOVERY_STRAIGHT_RATIO = 0.15
+'''max_steer의 이 비율 이하이면 직진에 가까운 조향으로 본다.'''
 STEER_RECOVERY_HARD_TICKS = 3
 STEER_RECOVERY_SLOW_TICKS = 2
 STEER_RECOVERY_SPEED_RATIO = 0.35
 ANGLE_CONTROL_DRIVE_NAMES = ("lane", "shortcut drive", "cornering drive")
 ANGLE_FILTER_EMA_ALPHA = 0.65
-ANGLE_FILTER_SLEW_RATE = 350.0  # steer command units/sec
+ANGLE_FILTER_SLEW_RATE = 350.0
+'''steer command units/sec'''
 ANGLE_CURVE_SPEED_GAIN = 8.0
-SPEED_SLEW_ACCEL_UP = 25.0  # speed command units/sec
-SPEED_SLEW_ACCEL_DOWN = 80.0  # speed command units/sec
+SPEED_SLEW_ACCEL_UP = 25.0
+'''speed command units/sec'''
+SPEED_SLEW_ACCEL_DOWN = 80.0
+'''speed command units/sec'''
 
 SHORTCUT_CAMERA_DETECT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect_cam/best_shortcut_cam_resnet18.pth"
 SHORTCUT_LIDAR_DETECT_MODEL_PATH = "/home/xytron/xycar_ws/Shortcut/shortcut_detect/best_shortcut_resnet18.pth"
@@ -284,6 +291,7 @@ SCHOOLZONE_CLASS_NAMES = ["none", "schoolzone"]
 
 
 def resolve_schoolzone_device(device, owner):
+    '''resolve schoolzone device 단계의 판단과 제어를 수행한다.'''
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda" and not torch.cuda.is_available():
@@ -293,6 +301,7 @@ def resolve_schoolzone_device(device, owner):
 
 class SchoolZoneCameraDetector:
 
+    '''SchoolZoneCameraDetector 관련 상태와 동작을 묶는다.'''
     def __init__(
         self,
         model_path,
@@ -300,6 +309,7 @@ class SchoolZoneCameraDetector:
         image_size=224,
         inference_period=0.02,
     ):
+        '''객체 초기 상태와 의존 모듈을 설정한다.'''
         self.model_path = Path(model_path).expanduser()
         if not self.model_path.exists():
             raise FileNotFoundError(f"schoolzone camera detect model not found: {self.model_path}")
@@ -328,6 +338,7 @@ class SchoolZoneCameraDetector:
         }
 
     def reset(self):
+        '''reset 단계의 판단과 제어를 수행한다.'''
         self.last_infer_time = 0.0
         self.last_result = (SCHOOLZONE_CLASS_NONE, 0.0, SCHOOLZONE_CLASS_NAMES[SCHOOLZONE_CLASS_NONE])
         self.last_debug = {
@@ -337,6 +348,7 @@ class SchoolZoneCameraDetector:
         }
 
     def preprocess(self, image):
+        '''preprocess 단계의 판단과 제어를 수행한다.'''
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         pil_image = PIL.Image.fromarray(rgb)
         if pil_image.size != (self.image_size, self.image_size):
@@ -346,6 +358,7 @@ class SchoolZoneCameraDetector:
         return tensor[None, ...]
 
     def process(self, image, now=None):
+        '''process 단계의 판단과 제어를 수행한다.'''
         if image is None:
             self.last_debug = {"ready": 0, "reason": "no_image"}
             self.last_result = (SCHOOLZONE_CLASS_NONE, 0.0, SCHOOLZONE_CLASS_NAMES[SCHOOLZONE_CLASS_NONE])
@@ -381,7 +394,9 @@ class SchoolZoneCameraDetector:
 
 class TrackDriverNode(Node):
 
+    '''TrackDriverNode 관련 상태와 동작을 묶는다.'''
     def __init__(self):
+        '''객체 초기 상태와 의존 모듈을 설정한다.'''
         super().__init__("driver")
         self.node_log_start_time = time.monotonic()
         self.mission_log_start_time = None
@@ -564,23 +579,29 @@ class TrackDriverNode(Node):
         self.log_info("----- track_drive traffic/cone/lane/shortcut/overtake/cornering models started -----")
 
     def log_prefix(self):
+        '''log prefix 단계의 판단과 제어를 수행한다.'''
         base_time = self.mission_log_start_time or self.node_log_start_time
         elapsed = time.monotonic() - base_time
         return f"[KST {datetime.now().strftime('%H:%M:%S')}] [T+{elapsed:07.2f}s]"
 
     def log_info(self, message):
+        '''log info 단계의 판단과 제어를 수행한다.'''
         self.get_logger().info(f"{self.log_prefix()} {message}")
 
     def log_warning(self, message):
+        '''log warning 단계의 판단과 제어를 수행한다.'''
         self.get_logger().warning(f"{self.log_prefix()} {message}")
 
     def log_error(self, message):
+        '''log error 단계의 판단과 제어를 수행한다.'''
         self.get_logger().error(f"{self.log_prefix()} {message}")
 
     def reset_shortcut_slowdown(self):
+        '''reset shortcut slowdown 단계의 판단과 제어를 수행한다.'''
         self.shortcut_slowdown_start_time = None
 
     def shortcut_slowdown_speed_limit(self, now):
+        '''shortcut slowdown speed limit 단계의 판단과 제어를 수행한다.'''
         if self.shortcut_slowdown_start_time is None:
             self.shortcut_slowdown_start_time = now
 
@@ -602,6 +623,7 @@ class TrackDriverNode(Node):
         inference_period,
         device=LANE_DEVICE,
     ):
+        '''create lane driver 단계의 판단과 제어를 수행한다.'''
         if LaneModelDriver is None:
             self.log_error(f"lane_drive import failed: {LANE_IMPORT_ERROR}")
             return None
@@ -643,6 +665,7 @@ class TrackDriverNode(Node):
         return driver
 
     def create_shortcut_camera_detector(self):
+        '''create shortcut camera detector 단계의 판단과 제어를 수행한다.'''
         if ShortcutCameraDetector is None:
             self.log_error(f"shortcut camera detector import failed: {SHORTCUT_IMPORT_ERROR}")
             return None
@@ -662,6 +685,7 @@ class TrackDriverNode(Node):
         return detector
 
     def create_shortcut_lidar_detector(self):
+        '''create shortcut lidar detector 단계의 판단과 제어를 수행한다.'''
         if ShortcutDetector is None:
             self.log_error(f"shortcut lidar detector import failed: {SHORTCUT_IMPORT_ERROR}")
             return None
@@ -681,6 +705,7 @@ class TrackDriverNode(Node):
         return detector
 
     def create_overtake_detector(self):
+        '''create overtake detector 단계의 판단과 제어를 수행한다.'''
         if OvertakeCameraDetector is None:
             self.log_error(f"overtake detector import failed: {OVERTAKE_IMPORT_ERROR}")
             return None
@@ -699,6 +724,7 @@ class TrackDriverNode(Node):
         return detector
 
     def create_overtake_camera_driver(self):
+        '''create overtake camera driver 단계의 판단과 제어를 수행한다.'''
         if OvertakeCameraDriver is None:
             self.log_error(f"overtake camera driver import failed: {OVERTAKE_IMPORT_ERROR}")
             return None
@@ -722,6 +748,7 @@ class TrackDriverNode(Node):
         return driver
 
     def create_cornering_detector(self):
+        '''create cornering detector 단계의 판단과 제어를 수행한다.'''
         if CorneringCameraDetector is None:
             self.log_error(f"cornering detector import failed: {CORNERING_IMPORT_ERROR}")
             return None
@@ -740,6 +767,7 @@ class TrackDriverNode(Node):
         return detector
 
     def create_schoolzone_detector(self):
+        '''create schoolzone detector 단계의 판단과 제어를 수행한다.'''
         try:
             detector = SchoolZoneCameraDetector(
                 model_path=SCHOOLZONE_MODEL_PATH,
@@ -754,6 +782,7 @@ class TrackDriverNode(Node):
         return detector
 
     def create_traffic_light_classifier(self):
+        '''create traffic light classifier 단계의 판단과 제어를 수행한다.'''
         if TrafficLightClassifier is None:
             self.log_error(f"traffic light classifier import failed: {TRAFFIC_LIGHT_IMPORT_ERROR}")
             return None
@@ -775,14 +804,17 @@ class TrackDriverNode(Node):
         return classifier
 
     def cam_callback(self, msg):
+        '''cam callback 단계의 판단과 제어를 수행한다.'''
         self.front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         self.sync_start_from_camera(self.front_image)
 
     def scan_callback(self, msg):
+        '''scan callback 단계의 판단과 제어를 수행한다.'''
         self.latest_scan = msg.ranges
 
     def sync_start_from_camera(self, image):
-        # 신호등 판단은 TrafficLight ResNet18 분류 모델로만 수행한다.
+        '''신호등 판단은 TrafficLight ResNet18 분류 모델로만 수행한다.'''
+        '''sync start from camera 단계의 판단과 제어를 수행한다.'''
         now = time.monotonic()
         if self.traffic_light_classifier is None:
             class_id = CLASS_NONE
@@ -804,6 +836,7 @@ class TrackDriverNode(Node):
                 self.start_cone(now)
 
     def update_trusted_traffic(self, class_id, probability, class_name, now):
+        '''update trusted traffic 단계의 판단과 제어를 수행한다.'''
         self.traffic_raw_class_id = class_id
         self.traffic_raw_class_name = class_name
         self.traffic_raw_prob = probability
@@ -847,6 +880,7 @@ class TrackDriverNode(Node):
         )
 
     def drive(self, angle, speed):
+        '''모터 명령을 제한값에 맞춰 발행한다.'''
         final_speed = float(speed)
         hard_speed_limit = None
         if self.state == STATE_OVERTAKE_DRIVE:
@@ -891,13 +925,15 @@ class TrackDriverNode(Node):
         self.motor_pub.publish(self.motor_msg)
 
     def update_signal_clock(self, now):
-        # 신호등 카운트 쿨타임은 벽시계가 아니라 실제 주행 시간 기준으로 누적한다.
+        '''신호등 카운트 쿨타임은 벽시계가 아니라 실제 주행 시간 기준으로 누적한다.'''
+        '''update signal clock 단계의 판단과 제어를 수행한다.'''
         dt = max(0.0, now - self.last_control_time)
         self.last_control_time = now
         if abs(float(self.motor_msg.speed)) > SIGNAL_CLOCK_MIN_SPEED:
             self.signal_clock += dt
 
     def reset_lane_pulse(self):
+        '''reset lane pulse 단계의 판단과 제어를 수행한다.'''
         self.lane_pulse_ticks_left = 0
         self.lane_pulse_angle = 0.0
         self.last_lane_infer_time = 0.0
@@ -906,9 +942,11 @@ class TrackDriverNode(Node):
         self.straight_recovery_ticks_left = 0
 
     def uses_angle_control(self, driver):
+        '''uses angle control 단계의 판단과 제어를 수행한다.'''
         return getattr(driver, "drive_name", "") in ANGLE_CONTROL_DRIVE_NAMES
 
     def reset_driver_angle_filter(self, driver):
+        '''reset driver angle filter 단계의 판단과 제어를 수행한다.'''
         if driver is None:
             return
         driver.filtered_target_angle = 0.0
@@ -916,6 +954,7 @@ class TrackDriverNode(Node):
         driver.filtered_angle_ready = False
 
     def filter_target_angle(self, driver, target_angle, now):
+        '''filter target angle 단계의 판단과 제어를 수행한다.'''
         target_angle = float(target_angle)
         if not self.uses_angle_control(driver):
             return target_angle
@@ -957,6 +996,7 @@ class TrackDriverNode(Node):
         return filtered
 
     def limit_speed_delta(self, driver, target_speed, now):
+        '''limit speed delta 단계의 판단과 제어를 수행한다.'''
         speed = float(target_speed)
         if not self.uses_angle_control(driver):
             return speed
@@ -979,6 +1019,7 @@ class TrackDriverNode(Node):
         return limited
 
     def reset_overtake_detection(self):
+        '''reset overtake detection 단계의 판단과 제어를 수행한다.'''
         self.overtake_candidate_start_time = None
         self.overtake_no_start_time = None
         self.overtake_last_yes_time = None
@@ -988,6 +1029,7 @@ class TrackDriverNode(Node):
         self.overtake_confirmed = False
 
     def reset_cornering_detection(self):
+        '''reset cornering detection 단계의 판단과 제어를 수행한다.'''
         self.cornering_candidate_start_time = None
         self.cornering_no_start_time = None
         self.cornering_last_yes_time = None
@@ -997,6 +1039,7 @@ class TrackDriverNode(Node):
         self.cornering_confirmed = False
 
     def start_overtake_monitor(self, now, reason):
+        '''start overtake monitor 단계의 판단과 제어를 수행한다.'''
         if self.overtake_detector is None:
             self.log_warning(f"OVERTAKE_DETECT skipped: detector is not ready ({reason})")
             return
@@ -1014,6 +1057,7 @@ class TrackDriverNode(Node):
         )
 
     def stop_overtake_monitor(self, reason):
+        '''stop overtake monitor 단계의 판단과 제어를 수행한다.'''
         if self.overtake_monitor_enabled or self.overtake_pending_after_green:
             self.log_info(f"OVERTAKE_DETECT OFF reason={reason}")
         self.overtake_monitor_enabled = False
@@ -1023,6 +1067,7 @@ class TrackDriverNode(Node):
             self.overtake_detector.reset()
 
     def update_overtake_detection(self, now, hold_time, label, require_monitor):
+        '''update overtake detection 단계의 판단과 제어를 수행한다.'''
         if require_monitor and not self.overtake_monitor_enabled:
             return False
         if self.overtake_done_in_segment:
@@ -1060,7 +1105,8 @@ class TrackDriverNode(Node):
         return self.overtake_confirmed
 
     def update_overtake_monitor(self, now):
-        # 일반 루트에서는 지정 시간 연속 Yes가 아니면 추월로 확정하지 않는다.
+        '''일반 루트에서는 지정 시간 연속 Yes가 아니면 추월로 확정하지 않는다.'''
+        '''update overtake monitor 단계의 판단과 제어를 수행한다.'''
         return self.update_overtake_detection(
             now,
             OVERTAKE_DETECT_HOLD_TIME,
@@ -1069,6 +1115,7 @@ class TrackDriverNode(Node):
         )
 
     def try_start_overtake_from_shortcut(self, now):
+        '''try start overtake from shortcut 단계의 판단과 제어를 수행한다.'''
         if self.state not in (
             STATE_SHORTCUT_CHECK,
             STATE_SHORTCUT_WAIT_TRAFFIC,
@@ -1095,7 +1142,8 @@ class TrackDriverNode(Node):
         return False
 
     def update_overtake_drive_release(self, now):
-        # 추월 주행 중에는 마지막 Yes 이후 3초 동안 추월 모델을 강제로 유지한다.
+        '''추월 주행 중에는 마지막 Yes 이후 3초 동안 추월 모델을 강제로 유지한다.'''
+        '''update overtake drive release 단계의 판단과 제어를 수행한다.'''
         if self.overtake_detector is None or self.front_image is None:
             if self.overtake_last_yes_time is None:
                 self.overtake_last_yes_time = now
@@ -1132,6 +1180,7 @@ class TrackDriverNode(Node):
         return force_left <= 0.0
 
     def start_overtake_drive(self, now):
+        '''start overtake drive 단계의 판단과 제어를 수행한다.'''
         if self.overtake_camera_driver is None or self.front_image is None:
             self.log_warning("OVERTAKE_DRIVE skipped: camera driver or front image is not ready")
             self.overtake_done_in_segment = True
@@ -1167,6 +1216,7 @@ class TrackDriverNode(Node):
         return True
 
     def finish_overtake_drive(self, now, reason):
+        '''finish overtake drive 단계의 판단과 제어를 수행한다.'''
         self.log_info(f"MODEL SWITCH OVERTAKE_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
@@ -1176,7 +1226,8 @@ class TrackDriverNode(Node):
         self.set_state(STATE_LANE)
 
     def update_cornering_monitor(self, now):
-        # 일반 LANE 주행 중에만 연속 코너링 구간을 감지한다.
+        '''일반 LANE 주행 중에만 연속 코너링 구간을 감지한다.'''
+        '''update cornering monitor 단계의 판단과 제어를 수행한다.'''
         if self.state != STATE_LANE or self.overtake_monitor_enabled:
             self.reset_cornering_detection()
             return False
@@ -1231,6 +1282,7 @@ class TrackDriverNode(Node):
         return self.cornering_confirmed
 
     def update_schoolzone_detection(self, now):
+        '''update schoolzone detection 단계의 판단과 제어를 수행한다.'''
         if self.state in (STATE_WAIT_GREEN, STATE_CONE):
             self.schoolzone_raw_class_id = 0
             self.schoolzone_raw_class_name = "none"
@@ -1274,6 +1326,7 @@ class TrackDriverNode(Node):
         return self.schoolzone_active
 
     def start_corner_drive(self, now):
+        '''start corner drive 단계의 판단과 제어를 수행한다.'''
         if self.state != STATE_LANE or self.overtake_monitor_enabled:
             self.reset_cornering_detection()
             return False
@@ -1297,6 +1350,7 @@ class TrackDriverNode(Node):
         return True
 
     def update_cornering_drive_release(self, now):
+        '''update cornering drive release 단계의 판단과 제어를 수행한다.'''
         drive_elapsed = now - self.state_start_time
         if drive_elapsed < CORNERING_MIN_DRIVE_TIME:
             if now - self.cornering_last_report_time >= CORNERING_LOG_PERIOD:
@@ -1337,6 +1391,7 @@ class TrackDriverNode(Node):
         return no_held >= CORNERING_CLEAR_HOLD_TIME
 
     def finish_corner_drive(self, now, reason):
+        '''finish corner drive 단계의 판단과 제어를 수행한다.'''
         self.log_info(f"MODEL SWITCH CORNER_DRIVE -> LANE reason={reason}")
         if self.lane_driver is not None:
             self.lane_driver.reset()
@@ -1348,7 +1403,8 @@ class TrackDriverNode(Node):
         self.set_state(STATE_LANE)
 
     def pulse_lane_command(self, driver, target_angle, speed):
-        # 모델은 0.08초마다 새 조향을 내고, 실제 모터에는 새 추론당 짧은 펄스만 준다.
+        '''모델은 0.08초마다 새 조향을 내고, 실제 모터에는 새 추론당 짧은 펄스만 준다.'''
+        '''pulse lane command 단계의 판단과 제어를 수행한다.'''
         infer_time = driver.last_infer_time if driver is not None else 0.0
         new_inference = infer_time > self.last_lane_infer_time
         if new_inference:
@@ -1402,7 +1458,8 @@ class TrackDriverNode(Node):
         return angle, speed
 
     def speed_for_steer(self, driver, target_angle, straight_speed):
-        # LANE/SHORTCUT/CORNER는 조향각을 곡률 프록시로 보고 더 민감하게 감속한다.
+        '''LANE/SHORTCUT/CORNER는 조향각을 곡률 프록시로 보고 더 민감하게 감속한다.'''
+        '''speed for steer 단계의 판단과 제어를 수행한다.'''
         max_steer = max(float(getattr(driver, "max_steer", LANE_MAX_STEER)), 1.0)
         abs_target_angle = abs(float(target_angle))
         steer_ratio = min(abs_target_angle / max_steer, 1.0)
@@ -1456,6 +1513,7 @@ class TrackDriverNode(Node):
         return scaled_speed
 
     def is_next_shortcut_signal_pending(self, now):
+        '''is next shortcut signal pending 단계의 판단과 제어를 수행한다.'''
         if self.lane_start_time is None:
             return False
         if now - self.lane_start_time < TRAFFIC_GROUP_MIN_LANE_TIME:
@@ -1469,8 +1527,9 @@ class TrackDriverNode(Node):
         return self.is_shortcut_traffic_group(next_group)
 
     def should_crawl_for_shortcut_signal_approach(self, now):
-        # 2/3번째 지름길 신호등은 신호등만 보인다고 감속하지 않는다.
-        # shortcut 카메라 판단이 먼저 YES/NO로 잡힌 뒤 SHORTCUT_CHECK에서 정지 판단한다.
+        '''2/3번째 지름길 신호등은 신호등만 보인다고 감속하지 않는다.'''
+        '''shortcut 카메라 판단이 먼저 YES/NO로 잡힌 뒤 SHORTCUT_CHECK에서 정지 판단한다.'''
+        '''should crawl for shortcut signal approach 단계의 판단과 제어를 수행한다.'''
         if not SHORTCUT_CHECK_ENABLED:
             return False
         if self.shortcut_done or self.shortcut_left_taken:
@@ -1485,6 +1544,7 @@ class TrackDriverNode(Node):
         return False
 
     def set_state(self, next_state):
+        '''set state 단계의 판단과 제어를 수행한다.'''
         if self.state == next_state:
             return
         self.state = next_state
@@ -1492,19 +1552,24 @@ class TrackDriverNode(Node):
         self.log_info(f"STATE -> {next_state}")
 
     def is_shortcut_traffic_group(self, group_index):
-        # 시작 신호등은 WAIT_GREEN/CONE에서 처리하고, 라바콘 이후 1/3/5번째만 지름길 판단 신호등이다.
+        '''시작 신호등은 WAIT_GREEN/CONE에서 처리하고, 라바콘 이후 1/3/5번째만 지름길 판단 신호등이다.'''
+        '''is shortcut traffic group 단계의 판단과 제어를 수행한다.'''
         return group_index in (1, 3, 5)
 
     def is_middle_traffic_group(self, group_index):
+        '''is middle traffic group 단계의 판단과 제어를 수행한다.'''
         return 0 < group_index <= TRAFFIC_GROUP_TOTAL and group_index % 2 == 0
 
     def is_active_shortcut_signal(self):
+        '''is active shortcut signal 단계의 판단과 제어를 수행한다.'''
         return self.is_shortcut_traffic_group(self.active_traffic_group)
 
     def is_active_middle_signal(self):
+        '''is active middle signal 단계의 판단과 제어를 수행한다.'''
         return self.is_middle_traffic_group(self.active_traffic_group)
 
     def correct_active_middle_to_shortcut_on_red_left(self, now):
+        '''correct active middle to shortcut on red left 단계의 판단과 제어를 수행한다.'''
         if not self.left_arrow_visible:
             return False
         if not self.is_active_middle_signal():
@@ -1533,6 +1598,7 @@ class TrackDriverNode(Node):
         return True
 
     def latch_shortcut_red_left_if_visible(self, now, source):
+        '''latch shortcut red left if visible 단계의 판단과 제어를 수행한다.'''
         if not self.left_arrow_visible:
             return False
         if (
@@ -1554,12 +1620,14 @@ class TrackDriverNode(Node):
         return True
 
     def is_first_forced_straight_signal(self):
+        '''is first forced straight signal 단계의 판단과 제어를 수행한다.'''
         return (
             self.is_active_shortcut_signal()
             and self.current_shortcut_signal_index() == ROUTE_SIGNAL_FIRST_BLOCKED_INDEX
         )
 
     def green_signal_visible_for_straight(self):
+        '''green signal visible for straight 단계의 판단과 제어를 수행한다.'''
         return self.green_visible or (
             self.traffic_raw_visible
             and self.traffic_raw_class_id == CLASS_GREEN
@@ -1567,6 +1635,7 @@ class TrackDriverNode(Node):
         )
 
     def should_limit_active_shortcut_speed(self):
+        '''should limit active shortcut speed 단계의 판단과 제어를 수행한다.'''
         if not self.is_active_shortcut_signal():
             return False
         if self.shortcut_left_taken:
@@ -1580,6 +1649,7 @@ class TrackDriverNode(Node):
         return self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX
 
     def start_post_shortcut_fast_to_corner(self, now, reason):
+        '''start post shortcut fast to corner 단계의 판단과 제어를 수행한다.'''
         if not POST_SHORTCUT_FAST_TO_CORNER_ENABLED:
             return
         if self.shortcut_left_taken:
@@ -1597,6 +1667,7 @@ class TrackDriverNode(Node):
         self.post_shortcut_fast_to_corner_active = True
 
     def stop_post_shortcut_fast_to_corner(self, reason):
+        '''stop post shortcut fast to corner 단계의 판단과 제어를 수행한다.'''
         if self.post_shortcut_fast_to_corner_active:
             self.log_info(f"POST_SHORTCUT_FAST OFF reason={reason}")
         self.post_shortcut_fast_to_corner_active = False
@@ -1604,6 +1675,7 @@ class TrackDriverNode(Node):
         self.post_shortcut_fast_source_group = 0
 
     def post_shortcut_fast_speed_override(self, now):
+        '''post shortcut fast speed override 단계의 판단과 제어를 수행한다.'''
         if not self.post_shortcut_fast_to_corner_active:
             return None
         if self.state != STATE_LANE:
@@ -1627,6 +1699,7 @@ class TrackDriverNode(Node):
         return POST_SHORTCUT_FAST_SPEED
 
     def should_stop_for_active_shortcut_non_green(self):
+        '''should stop for active shortcut non green 단계의 판단과 제어를 수행한다.'''
         if not self.is_active_shortcut_signal():
             return False
         if self.shortcut_straight_green_latched:
@@ -1638,8 +1711,9 @@ class TrackDriverNode(Node):
         return True
 
     def should_stop_after_shortcut_taken_for_signal(self, now):
-        # 지름길을 한 번 탔더라도 이후 shortcut 그룹 신호등은 초록불일 때만 통과한다.
-        # 이 경로는 지름길 판단은 생략하지만 신호 대기는 생략하면 안 된다.
+        '''지름길을 한 번 탔더라도 이후 shortcut 그룹 신호등은 초록불일 때만 통과한다.'''
+        '''이 경로는 지름길 판단은 생략하지만 신호 대기는 생략하면 안 된다.'''
+        '''should stop after shortcut taken for signal 단계의 판단과 제어를 수행한다.'''
         if not self.shortcut_left_taken:
             return False
         if self.green_signal_visible_for_straight():
@@ -1653,12 +1727,14 @@ class TrackDriverNode(Node):
         return self.is_next_shortcut_signal_pending(now)
 
     def should_crawl_first_shortcut_wait_green(self, now):
+        '''should crawl first shortcut wait green 단계의 판단과 제어를 수행한다.'''
         if self.current_shortcut_signal_index() != ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
             return False
         start_time = self.shortcut_wait_signal_start_time or self.state_start_time
         return now - start_time < FIRST_SHORTCUT_WAIT_CRAWL_TIME
 
     def current_shortcut_signal_index(self):
+        '''current shortcut signal index 단계의 판단과 제어를 수행한다.'''
         if self.pending_shortcut_route_signal > 0:
             return self.pending_shortcut_route_signal
         if self.is_active_shortcut_signal():
@@ -1666,10 +1742,12 @@ class TrackDriverNode(Node):
         return self.route_signal_count
 
     def shortcut_detector_supports_none(self):
+        '''shortcut detector supports none 단계의 판단과 제어를 수행한다.'''
         class_names = getattr(self.shortcut_detector, "class_names", [])
         return "none" in class_names
 
     def new_shortcut_sensor_state(self):
+        '''new shortcut sensor state 단계의 판단과 제어를 수행한다.'''
         return {
             "raw": "none",
             "candidate": "none",
@@ -1681,12 +1759,14 @@ class TrackDriverNode(Node):
         }
 
     def reset_shortcut_fusion_state(self):
+        '''reset shortcut fusion state 단계의 판단과 제어를 수행한다.'''
         if not hasattr(self, "shortcut_sensor_states"):
             return
         for key in self.shortcut_sensor_states:
             self.shortcut_sensor_states[key] = self.new_shortcut_sensor_state()
 
     def update_shortcut_sensor_state(self, source, class_name, open_prob, blocked_prob, none_prob, now):
+        '''update shortcut sensor state 단계의 판단과 제어를 수행한다.'''
         state = self.shortcut_sensor_states[source]
         class_name = class_name if class_name in ("open", "blocked", "none") else "none"
         state["raw"] = class_name
@@ -1716,6 +1796,7 @@ class TrackDriverNode(Node):
         return state
 
     def update_shortcut_sensor_from_camera(self, now):
+        '''update shortcut sensor from camera 단계의 판단과 제어를 수행한다.'''
         if self.shortcut_detector is None or self.front_image is None:
             return self.update_shortcut_sensor_state("camera", "none", 0.0, 0.0, 0.0, now)
 
@@ -1734,6 +1815,7 @@ class TrackDriverNode(Node):
         )
 
     def update_shortcut_sensor_from_lidar(self, now):
+        '''update shortcut sensor from lidar 단계의 판단과 제어를 수행한다.'''
         if self.shortcut_lidar_detector is None or self.latest_scan is None:
             return self.update_shortcut_sensor_state("lidar", "none", 0.0, 0.0, 0.0, now)
 
@@ -1752,6 +1834,7 @@ class TrackDriverNode(Node):
         )
 
     def summarize_shortcut_fusion(self, now):
+        '''summarize shortcut fusion 단계의 판단과 제어를 수행한다.'''
         camera = self.shortcut_sensor_states["camera"]
         lidar = self.shortcut_sensor_states["lidar"]
         camera_class = camera["trusted"]
@@ -1806,14 +1889,17 @@ class TrackDriverNode(Node):
         }
 
     def update_shortcut_fusion(self, now):
+        '''update shortcut fusion 단계의 판단과 제어를 수행한다.'''
         self.update_shortcut_sensor_from_camera(now)
         self.update_shortcut_sensor_from_lidar(now)
         return self.summarize_shortcut_fusion(now)
 
     def next_shortcut_group_index(self):
+        '''next shortcut group index 단계의 판단과 제어를 수행한다.'''
         return self.route_signal_count * 2 + 1
 
     def reset_shortcut_cache(self):
+        '''reset shortcut cache 단계의 판단과 제어를 수행한다.'''
         self.shortcut_cache = []
         self.shortcut_cache_status = {
             "ready": 0,
@@ -1828,6 +1914,7 @@ class TrackDriverNode(Node):
         self.reset_shortcut_fusion_state()
 
     def reset_shortcut_detectors(self):
+        '''reset shortcut detectors 단계의 판단과 제어를 수행한다.'''
         if self.shortcut_detector is not None:
             self.shortcut_detector.reset()
         if self.shortcut_lidar_detector is not None:
@@ -1835,10 +1922,12 @@ class TrackDriverNode(Node):
         self.reset_shortcut_fusion_state()
 
     def prune_shortcut_cache(self, now):
+        '''prune shortcut cache 단계의 판단과 제어를 수행한다.'''
         min_time = now - SHORTCUT_CACHE_WINDOW
         self.shortcut_cache = [sample for sample in self.shortcut_cache if sample[0] >= min_time]
 
     def summarize_shortcut_cache(self, now):
+        '''summarize shortcut cache 단계의 판단과 제어를 수행한다.'''
         self.prune_shortcut_cache(now)
         samples = len(self.shortcut_cache)
         if samples == 0:
@@ -1879,7 +1968,8 @@ class TrackDriverNode(Node):
         return self.shortcut_cache_status
 
     def update_shortcut_cache(self, now):
-        # 라바콘 이후에는 전방 카메라 지름길 판단을 계속 굴려서 신호등 앞 결정 지연을 줄인다.
+        '''라바콘 이후에는 전방 카메라 지름길 판단을 계속 굴려서 신호등 앞 결정 지연을 줄인다.'''
+        '''update shortcut cache 단계의 판단과 제어를 수행한다.'''
         if not SHORTCUT_CHECK_ENABLED or self.shortcut_detector is None or self.front_image is None:
             return self.summarize_shortcut_cache(now)
 
@@ -1894,7 +1984,8 @@ class TrackDriverNode(Node):
         return self.summarize_shortcut_cache(now)
 
     def should_trigger_shortcut_by_camera(self, now, shortcut_cache):
-        # 신호등 분류가 안 떠도 3클래스 카메라 모델이 지름길 장면을 잡으면 먼저 판단한다.
+        '''신호등 분류가 안 떠도 3클래스 카메라 모델이 지름길 장면을 잡으면 먼저 판단한다.'''
+        '''should trigger shortcut by camera 단계의 판단과 제어를 수행한다.'''
         if not SHORTCUT_CAMERA_TRIGGER_ENABLED:
             return False
         if not self.shortcut_detector_supports_none():
@@ -1915,6 +2006,7 @@ class TrackDriverNode(Node):
         return True
 
     def has_shortcut_camera_decision(self, shortcut_cache):
+        '''has shortcut camera decision 단계의 판단과 제어를 수행한다.'''
         if not shortcut_cache["ready"]:
             return False
         return (
@@ -1923,8 +2015,9 @@ class TrackDriverNode(Node):
         )
 
     def should_trigger_shortcut_by_camera_with_traffic(self, now, shortcut_cache):
-        # 카메라가 먼저 지름길 YES/NO를 잡고 신호등도 보이면, group 2초 확정 전이라도
-        # 라이다 융합 판단으로 들어가 정지 상태에서 YES/NO를 확정한다.
+        '''카메라가 먼저 지름길 YES/NO를 잡고 신호등도 보이면, group 2초 확정 전이라도'''
+        '''라이다 융합 판단으로 들어가 정지 상태에서 YES/NO를 확정한다.'''
+        '''should trigger shortcut by camera with traffic 단계의 판단과 제어를 수행한다.'''
         if not SHORTCUT_CHECK_ENABLED or self.shortcut_done or self.shortcut_left_taken:
             return False
         if not self.traffic_visible:
@@ -1947,8 +2040,9 @@ class TrackDriverNode(Node):
         return self.has_shortcut_camera_decision(shortcut_cache)
 
     def should_start_shortcut_check_before_group_confirm(self, now, shortcut_cache):
-        # 다음 신호등이 지름길 판단 신호등일 차례라면, 2초 group 확정 전이라도
-        # 신호등만으로는 감속하지 않고, shortcut 카메라 판단이 YES/NO로 잡힌 뒤에만 멈춰 판단한다.
+        '''다음 신호등이 지름길 판단 신호등일 차례라면, 2초 group 확정 전이라도'''
+        '''신호등만으로는 감속하지 않고, shortcut 카메라 판단이 YES/NO로 잡힌 뒤에만 멈춰 판단한다.'''
+        '''should start shortcut check before group confirm 단계의 판단과 제어를 수행한다.'''
         if not SHORTCUT_CHECK_ENABLED or self.shortcut_done or self.shortcut_left_taken:
             return False
         if not (self.traffic_raw_visible or self.traffic_visible):
@@ -1971,6 +2065,7 @@ class TrackDriverNode(Node):
         return self.is_shortcut_traffic_group(next_group)
 
     def start_shortcut_check_before_group_confirm(self, now, shortcut_cache, source):
+        '''start shortcut check before group confirm 단계의 판단과 제어를 수행한다.'''
         next_group = self.traffic_group_count + 1
         if next_group > TRAFFIC_GROUP_TOTAL:
             self.shortcut_done = True
@@ -1993,6 +2088,7 @@ class TrackDriverNode(Node):
         return self.handle_shortcut_signal_decision(now, shortcut_cache, source)
 
     def confirm_pending_shortcut_group_if_ready(self, now):
+        '''confirm pending shortcut group if ready 단계의 판단과 제어를 수행한다.'''
         if self.pending_shortcut_group <= 0:
             return False
 
@@ -2037,6 +2133,7 @@ class TrackDriverNode(Node):
         return True
 
     def force_confirm_pending_shortcut_group(self, now, reason):
+        '''force confirm pending shortcut group 단계의 판단과 제어를 수행한다.'''
         if self.pending_shortcut_group <= 0:
             return False
 
@@ -2062,6 +2159,7 @@ class TrackDriverNode(Node):
         return True
 
     def claim_shortcut_group_by_camera(self, now, shortcut_cache):
+        '''claim shortcut group by camera 단계의 판단과 제어를 수행한다.'''
         next_group = self.next_shortcut_group_index()
         if next_group > TRAFFIC_GROUP_TOTAL:
             self.shortcut_done = True
@@ -2088,7 +2186,8 @@ class TrackDriverNode(Node):
         return True
 
     def update_traffic_group(self, now, allow_shortcut=True):
-        # 신호등이 프레임마다 반복 검출되므로, 보이는 구간 전체를 하나의 그룹으로 묶는다.
+        '''신호등이 프레임마다 반복 검출되므로, 보이는 구간 전체를 하나의 그룹으로 묶는다.'''
+        '''update traffic group 단계의 판단과 제어를 수행한다.'''
         if not self.traffic_visible:
             clear_elapsed = now - self.traffic_last_visible_time
             if (
@@ -2167,6 +2266,7 @@ class TrackDriverNode(Node):
         return "middle"
 
     def finish_traffic_group(self):
+        '''finish traffic group 단계의 판단과 제어를 수행한다.'''
         group = self.active_traffic_group
         if self.is_middle_traffic_group(group):
             self.stop_overtake_monitor(f"middle signal group {group} passed")
@@ -2192,6 +2292,7 @@ class TrackDriverNode(Node):
         self.reset_shortcut_slowdown()
 
     def start_cone(self, now):
+        '''start cone 단계의 판단과 제어를 수행한다.'''
         if self.mission_log_start_time is None:
             self.mission_log_start_time = now
         if self.cone_lane_driver is None:
@@ -2211,6 +2312,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_CONE)
 
     def start_lane(self, now):
+        '''start lane 단계의 판단과 제어를 수행한다.'''
         self.last_log_time = now
         if self.lane_driver is None:
             self.log_error("lane driver is not ready; stopping after cone sequence")
@@ -2259,6 +2361,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_LANE)
 
     def start_shortcut_check(self, now, force_blocked=False, stop_for_decision=False):
+        '''start shortcut check 단계의 판단과 제어를 수행한다.'''
         if self.shortcut_detector is None or self.shortcut_lidar_detector is None or self.front_image is None:
             if self.current_shortcut_signal_index() >= ROUTE_SIGNAL_TOTAL:
                 self.shortcut_done = True
@@ -2294,6 +2397,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_SHORTCUT_CHECK)
 
     def start_shortcut_wait_green(self, now, reason, enable_overtake_after_green=True):
+        '''start shortcut wait green 단계의 판단과 제어를 수행한다.'''
         self.shortcut_wait_signal_start_time = now
         self.shortcut_force_blocked_check = False
         self.shortcut_stop_for_decision_check = False
@@ -2311,6 +2415,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_SHORTCUT_WAIT_GREEN)
 
     def start_shortcut_wait_signal(self, now):
+        '''start shortcut wait signal 단계의 판단과 제어를 수행한다.'''
         self.shortcut_wait_signal_start_time = now
         self.shortcut_force_blocked_check = False
         self.shortcut_stop_for_decision_check = False
@@ -2325,6 +2430,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_SHORTCUT_WAIT_SIGNAL)
 
     def start_shortcut_wait_traffic(self, now, reason):
+        '''start shortcut wait traffic 단계의 판단과 제어를 수행한다.'''
         self.shortcut_wait_signal_start_time = now
         self.shortcut_force_blocked_check = False
         self.shortcut_stop_for_decision_check = False
@@ -2341,13 +2447,15 @@ class TrackDriverNode(Node):
         self.set_state(STATE_SHORTCUT_WAIT_TRAFFIC)
 
     def start_shortcut_wait_signal_after_traffic_check(self, now, reason):
-        # 지름길 YES가 떠도 신호등이 보이지 않으면 오검출 가능성이 있으므로 저속으로 신호등을 다시 찾는다.
+        '''지름길 YES가 떠도 신호등이 보이지 않으면 오검출 가능성이 있으므로 저속으로 신호등을 다시 찾는다.'''
+        '''start shortcut wait signal after traffic check 단계의 판단과 제어를 수행한다.'''
         if self.traffic_visible:
             self.start_shortcut_wait_signal(now)
             return
         self.start_shortcut_wait_traffic(now, reason)
 
     def start_shortcut_drive(self, now):
+        '''start shortcut drive 단계의 판단과 제어를 수행한다.'''
         self.stop_overtake_monitor("shortcut drive selected")
         self.stop_post_shortcut_fast_to_corner("shortcut drive selected")
         if self.shortcut_lane_driver is None:
@@ -2382,6 +2490,7 @@ class TrackDriverNode(Node):
         self.set_state(STATE_SHORTCUT_DRIVE)
 
     def run_cone(self, now):
+        '''run cone 단계의 판단과 제어를 수행한다.'''
         if self.cone_move_start_time is None:
             self.cone_move_start_time = now
 
@@ -2393,6 +2502,7 @@ class TrackDriverNode(Node):
         self.run_model_drive(self.cone_lane_driver, now)
 
     def run_model_drive(self, driver, now, speed_limit=None, speed_override=None):
+        '''run model drive 단계의 판단과 제어를 수행한다.'''
         if driver is None or self.front_image is None:
             self.reset_lane_pulse()
             self.drive(0.0, STOP_SPEED)
@@ -2409,7 +2519,7 @@ class TrackDriverNode(Node):
             self.lane_pulse_debug.pop("speed_override", None)
 
         if drive_name == "overtake drive":
-            # 추월 모델은 신호등/지름길 대기나 공통 조향 감속 정책과 완전히 분리한다.
+            '''추월 모델은 신호등/지름길 대기나 공통 조향 감속 정책과 완전히 분리한다.'''
             speed = float(speed)
             self.hard_turn_ticks = 0
             self.straight_recovery_ticks_left = 0
@@ -2440,7 +2550,8 @@ class TrackDriverNode(Node):
         self.drive(angle, speed)
 
     def apply_drive_angle_offset(self, driver, target_angle):
-        # 콘 구간은 모델이 틀겠다고 한 방향을 유지한 채 조향 크기만 살짝 키운다.
+        '''콘 구간은 모델이 틀겠다고 한 방향을 유지한 채 조향 크기만 살짝 키운다.'''
+        '''apply drive angle offset 단계의 판단과 제어를 수행한다.'''
         raw_angle = float(target_angle)
         drive_name = getattr(driver, "drive_name", "")
         scale = 1.0
@@ -2461,6 +2572,7 @@ class TrackDriverNode(Node):
         return corrected_angle
 
     def handle_shortcut_signal_decision(self, now, shortcut_cache, source):
+        '''handle shortcut signal decision 단계의 판단과 제어를 수행한다.'''
         shortcut_signal_index = self.current_shortcut_signal_index()
         if shortcut_signal_index == ROUTE_SIGNAL_FIRST_BLOCKED_INDEX:
             if self.green_signal_visible_for_straight():
@@ -2551,6 +2663,7 @@ class TrackDriverNode(Node):
         return False
 
     def run_lane(self, now):
+        '''run lane 단계의 판단과 제어를 수행한다.'''
         shortcut_cache = self.update_shortcut_cache(now)
         self.confirm_pending_shortcut_group_if_ready(now)
         signal_kind = self.update_traffic_group(now)
@@ -2623,7 +2736,7 @@ class TrackDriverNode(Node):
             self.drive(0.0, STOP_SPEED)
             return
 
-        # 지름길 판단 신호등에서 직진 루트로 갈 때도 초록불 전에는 절대 진행하지 않는다.
+        '''지름길 판단 신호등에서 직진 루트로 갈 때도 초록불 전에는 절대 진행하지 않는다.'''
         if self.should_stop_for_active_shortcut_non_green():
             if now - self.shortcut_check_last_report_time >= SHORTCUT_CHECK_LOG_PERIOD:
                 self.shortcut_check_last_report_time = now
@@ -2639,7 +2752,7 @@ class TrackDriverNode(Node):
             self.drive(0.0, STOP_SPEED)
             return
 
-        # middle 신호등은 무시하고 통과한다. 그 외 예상 밖 일반 빨간불은 정지한다.
+        '''middle 신호등은 무시하고 통과한다. 그 외 예상 밖 일반 빨간불은 정지한다.'''
         if (
             self.red_visible
             and not self.is_active_shortcut_signal()
@@ -2682,7 +2795,8 @@ class TrackDriverNode(Node):
             self.run_model_drive(self.lane_driver, now)
 
     def run_shortcut_check(self, now):
-        # 첫 번째 강제 직진 신호는 저속 접근, 2/3번째는 정지 상태에서 카메라+라이다 결론을 낸다.
+        '''첫 번째 강제 직진 신호는 저속 접근, 2/3번째는 정지 상태에서 카메라+라이다 결론을 낸다.'''
+        '''run shortcut check 단계의 판단과 제어를 수행한다.'''
         self.confirm_pending_shortcut_group_if_ready(now)
         if self.try_start_overtake_from_shortcut(now):
             return
@@ -2782,6 +2896,7 @@ class TrackDriverNode(Node):
         )
 
     def run_shortcut_wait_green(self, now):
+        '''run shortcut wait green 단계의 판단과 제어를 수행한다.'''
         self.confirm_pending_shortcut_group_if_ready(now)
         if self.try_start_overtake_from_shortcut(now):
             return
@@ -2853,6 +2968,7 @@ class TrackDriverNode(Node):
             self.drive(0.0, STOP_SPEED)
 
     def run_shortcut_wait_traffic(self, now):
+        '''run shortcut wait traffic 단계의 판단과 제어를 수행한다.'''
         self.confirm_pending_shortcut_group_if_ready(now)
         if self.try_start_overtake_from_shortcut(now):
             return
@@ -2883,6 +2999,7 @@ class TrackDriverNode(Node):
         )
 
     def run_shortcut_wait_signal(self, now):
+        '''run shortcut wait signal 단계의 판단과 제어를 수행한다.'''
         self.confirm_pending_shortcut_group_if_ready(now)
         if self.try_start_overtake_from_shortcut(now):
             return
@@ -2919,6 +3036,7 @@ class TrackDriverNode(Node):
         self.drive(0.0, STOP_SPEED)
 
     def run_shortcut_drive(self, now):
+        '''run shortcut drive 단계의 판단과 제어를 수행한다.'''
         if self.schoolzone_active:
             elapsed = now - self.state_start_time
             self.finish_shortcut_drive(
@@ -2932,6 +3050,7 @@ class TrackDriverNode(Node):
         self.run_model_drive(self.shortcut_lane_driver, now)
 
     def finish_shortcut_drive(self, now, reason):
+        '''finish shortcut drive 단계의 판단과 제어를 수행한다.'''
         self.shortcut_done = self.route_signal_count >= ROUTE_SIGNAL_TOTAL
         if self.lane_driver is not None:
             self.lane_driver.reset()
@@ -2951,7 +3070,8 @@ class TrackDriverNode(Node):
         self.set_state(STATE_LANE)
 
     def run_overtake_drive(self, now):
-        # 추월 구간은 지름길/신호등 정책과 독립이다. 이 상태에서는 group/shortcut 판단을 호출하지 않는다.
+        '''추월 구간은 지름길/신호등 정책과 독립이다. 이 상태에서는 group/shortcut 판단을 호출하지 않는다.'''
+        '''run overtake drive 단계의 판단과 제어를 수행한다.'''
         if self.update_overtake_drive_release(now):
             self.finish_overtake_drive(
                 now,
@@ -2963,7 +3083,8 @@ class TrackDriverNode(Node):
         self.run_model_drive(self.overtake_camera_driver, now)
 
     def run_corner_drive(self, now):
-        # 연속 코너링 구간에서는 지름길/추월 판단을 끄고 코너링 전용 주행 모델만 쓴다.
+        '''연속 코너링 구간에서는 지름길/추월 판단을 끄고 코너링 전용 주행 모델만 쓴다.'''
+        '''run corner drive 단계의 판단과 제어를 수행한다.'''
         if self.update_cornering_drive_release(now):
             self.finish_corner_drive(
                 now,
@@ -2975,6 +3096,7 @@ class TrackDriverNode(Node):
         self.run_model_drive(self.cornering_lane_driver, now, speed_limit=CORNERING_DRIVE_SPEED)
 
     def control_loop(self):
+        '''현재 상태에 맞는 주행 제어 루프를 실행한다.'''
         now = time.monotonic()
         self.update_signal_clock(now)
         self.update_schoolzone_detection(now)
@@ -3010,6 +3132,7 @@ class TrackDriverNode(Node):
         self.log_status(green)
 
     def log_status(self, green):
+        '''현재 주행 상태와 센서 판단 값을 로그로 출력한다.'''
         now = time.monotonic()
         if now - self.last_log_time < LOG_PERIOD:
             return
@@ -3116,6 +3239,7 @@ class TrackDriverNode(Node):
 
 
 def main(args=None):
+    '''ROS2 노드를 생성하고 종료 처리를 수행한다.'''
     rclpy.init(args=args)
     node = TrackDriverNode()
     try:
@@ -3129,4 +3253,5 @@ def main(args=None):
 
 
 if __name__ == "__main__":
+    '''스크립트 직접 실행 시 main을 호출한다.'''
     main()
